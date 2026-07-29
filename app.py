@@ -28,6 +28,13 @@ HEADERS = {
 
 MAX_RESULTS = 50
 
+# Ungültige Bild-Schlüsselwörter (z.B. OBI-Biber, Logos, Icons)
+BAD_IMG_KEYWORDS = [
+    'logo', 'icon', 'hey-obi', 'bieber', 'biber', 'footer', 'header',
+    'banner', 'app', 'placeholder', 'svg', 'rating', 'star', 'wishlist',
+    'heart', 'herz', 'avatar', 'badge', 'stiftung', 'warentest'
+]
+
 def get_session():
     if HAS_CURL:
         session = crequests.Session(impersonate="chrome120")
@@ -46,6 +53,12 @@ def format_price_string(text):
     match_int = re.search(r'^(\d{1,4})$', text)
     if match_int: return f"{match_int.group(1)},00 €"
     return "-"
+
+def is_valid_image(url):
+    if not url or not isinstance(url, str): return False
+    url_l = url.lower()
+    if not url_l.startswith('http') or url_l.startswith('data:image'): return False
+    return not any(bad in url_l for bad in BAD_IMG_KEYWORDS)
 
 def deduplicate(products):
     seen, unique = set(), []
@@ -95,7 +108,7 @@ def extract_product_tiles(html, domain, url_validator):
         title = ""
         for img_cand in container.find_all('img'):
             alt = img_cand.get('alt', '').strip()
-            if alt and len(alt) > 6 and not any(bad in alt.lower() for bad in ['logo', 'herz', 'wishlist', 'icon']):
+            if alt and len(alt) > 6 and not any(bad in alt.lower() for bad in BAD_IMG_KEYWORDS):
                 title = alt
                 break
                
@@ -114,12 +127,11 @@ def extract_product_tiles(html, domain, url_validator):
             src = (img_tag.get('src') or img_tag.get('data-src') or img_tag.get('data-srcset') or img_tag.get('srcset') or '')
             if src:
                 src = src.split(',')[0].split(' ')[0].strip()
-                if not any(bad in src.lower() for bad in ['heart', 'herz', 'icon', 'placeholder', '.svg', 'logo']):
-                    if src.startswith('//'): src = 'https:' + src
-                    elif src.startswith('/'): src = f"https://www.{domain}" + src
-                    if src.startswith('http') and not src.startswith('data:image'):
-                        img_url = src
-                        break
+                if src.startswith('//'): src = 'https:' + src
+                elif src.startswith('/'): src = f"https://www.{domain}" + src
+                if is_valid_image(src):
+                    img_url = src
+                    break
                    
         price = "-"
         m = re.search(r'(\d{1,4}[.,]\d{2})\s*€?', container.get_text(separator=' '))
@@ -134,32 +146,25 @@ def extract_product_tiles(html, domain, url_validator):
 # ===================================================================
 # MULTI SEARCH FALLBACK (Ecosia + Yahoo + DuckDuckGo + Bing)
 # ===================================================================
-def execute_external_search(session, domain, keyword, valid_url_func, shop_key):
+def execute_external_search(session, domain, keyword, valid_url_func):
     products, seen = [], set()
-   
-    # Smarter Such-Query: Erzwingt echte Produktseiten, filtert Kategorien!
     q = f"site:{domain} {keyword}"
-    if shop_key == 'ikea': q += " inurl:/p/"
-    elif shop_key == 'netto': q += " inurl:/p/"
-    elif shop_key == 'decathlon': q += " inurl:/p/"
-    elif shop_key == 'hm': q += " inurl:productpage"
-    elif shop_key == 'obi': q += " inurl:/p/"
-    elif shop_key == 'bauhaus': q += " inurl:/p/"
 
-    # 1. ECOSIA (Sehr stark gegen Bot-Sperren)
+    # 1. ECOSIA
     try:
         res = session.get(f"https://www.ecosia.org/search?q={urllib.parse.quote(q)}", timeout=8)
         if res.status_code == 200:
             soup = BeautifulSoup(res.content, 'html.parser')
             for a in soup.find_all('a', href=True):
-                link = a['href']
-                if link.startswith('http') and valid_url_func(link) and link not in seen and 'ecosia' not in link:
+                link = a['href'].split('?')[0].split('#')[0]
+                if valid_url_func(link) and link not in seen and 'ecosia' not in link:
                     title = a.get_text(strip=True)
                     title = re.sub(r'\s*[:|-|•]\s*.*$', '', title).strip()
-                    if len(title) > 4:
+                    if len(title) > 4 and not title.lower().startswith('http'):
                         products.append({"title": title, "price": "-", "imageUrl": "", "link": link})
                         seen.add(link)
     except Exception: pass
+
     if len(products) >= MAX_RESULTS: return products[:MAX_RESULTS]
 
     # 2. YAHOO
@@ -180,6 +185,7 @@ def execute_external_search(session, domain, keyword, valid_url_func, shop_key):
                         products.append({"title": title, "price": "-", "imageUrl": "", "link": link})
                         seen.add(link)
     except Exception: pass
+
     if len(products) >= MAX_RESULTS: return products[:MAX_RESULTS]
 
     # 3. DUCKDUCKGO
@@ -196,7 +202,7 @@ def execute_external_search(session, domain, keyword, valid_url_func, shop_key):
                     title_elem = container.find('h2', class_='result__title') if container else None
                     title = title_elem.get_text(strip=True) if title_elem else a.get_text(strip=True)
                     title = re.sub(r'\s*[:|-|•]\s*.*$', '', title).strip()
-                    if len(title) > 4:
+                    if len(title) > 4 and not title.lower().startswith('http'):
                         products.append({"title": title, "price": "-", "imageUrl": "", "link": href})
                         seen.add(href)
     except Exception: pass
@@ -205,7 +211,7 @@ def execute_external_search(session, domain, keyword, valid_url_func, shop_key):
 
 
 # ===================================================================
-# ENRICHER (Inkl. Spezial-Scannern für OBI, Norma & Otto)
+# ENRICHER (Inkl. Spezial-Scannern)
 # ===================================================================
 def enrich_single_product(p, session, shop_key):
     if p.get('imageUrl') and p.get('price') != '-': return p
@@ -221,12 +227,12 @@ def enrich_single_product(p, session, shop_key):
                     data = json.loads(script.string or '')
                     items = data if isinstance(data, list) else [data]
                     for item in items:
-                        if isinstance(item, dict) and item.get('@type') in ['Product', 'IndividualProduct']:
+                        if isinstance(item, dict) and item.get('@type') in ['Product', 'IndividualProduct', 'ItemPage']:
                             if not p.get('imageUrl'):
                                 img = item.get('image')
                                 if isinstance(img, list) and img: img = img[0]
                                 elif isinstance(img, dict): img = img.get('url')
-                                if isinstance(img, str) and img.startswith('http'): p['imageUrl'] = img
+                                if is_valid_image(img): p['imageUrl'] = img
 
                             if p.get('price') == '-':
                                 offers = item.get('offers')
@@ -236,36 +242,38 @@ def enrich_single_product(p, session, shop_key):
                                     if pr: p['price'] = format_price_string(str(pr))
                 except Exception: pass
 
-            # 2. Spezial-Fix: Norma Preis
+            # 2. Spezial-Fix OBI (Nur echte Produkt-Medien erlaubt!)
+            if shop_key == 'obi' and (not p.get('imageUrl') or not is_valid_image(p.get('imageUrl'))):
+                m_obi = re.search(r'(https://media\.obi\.de/product/[^"\'\s\\]+\.(?:jpg|png|webp))', html)
+                if m_obi:
+                    p['imageUrl'] = m_obi.group(1).replace('\\u002F', '/')
+                else:
+                    m_obi2 = re.search(r'(https://assets\.obi\.de/[^"\'\s\\]+\.(?:jpg|png|webp))', html)
+                    if m_obi2: p['imageUrl'] = m_obi2.group(1).replace('\\u002F', '/')
+
+            # 3. Spezial-Fix Norma (Preise)
             if shop_key == 'norma' and p.get('price') == '-':
                 m_norma = re.search(r'itemprop=["\']price["\'][^>]*content=["\']([\d\.]+)["\']', html)
                 if m_norma: p['price'] = format_price_string(m_norma.group(1))
 
-            # 3. Spezial-Fix: OBI Bild
-            if shop_key == 'obi' and not p.get('imageUrl'):
-                m_obi = re.search(r'(https://media\.obi\.de/[^"\'\s\\]+\.(?:jpg|png|webp))', html)
-                if m_obi: p['imageUrl'] = m_obi.group(1).replace('\\u002F', '/')
-                else:
-                    m_obi2 = re.search(r'(https://[^"\'\s\\]*\.obi\.[a-z]{2,3}/[^"\'\s\\]+\.(?:jpg|png|webp))', html)
-                    if m_obi2: p['imageUrl'] = m_obi2.group(1).replace('\\u002F', '/')
-
-            # 4. Otto Fix
+            # 4. Spezial-Fix Otto
             if shop_key == 'otto':
-                if not p.get('imageUrl'):
+                if not p.get('imageUrl') or not is_valid_image(p.get('imageUrl')):
                     m_otto_img = re.search(r'["\'](https://i\.otto\.de/i/otto/[^"\']+)["\']', html)
                     if m_otto_img: p['imageUrl'] = m_otto_img.group(1)
                 if p.get('price') == '-':
-                    m_otto_pr = re.search(r'data-qa=["\']price["\'][^>]*>([^<]+)', html)
+                    m_otto_pr = re.search(r'data-qa=["\']price["\'][^>]*>([^<]+)', html) or re.search(r'(\d+[\.,]\d{2})\s*€', html)
                     if m_otto_pr: p['price'] = format_price_string(m_otto_pr.group(1))
 
             # 5. Fallback Meta-Tags
             if p.get('price') == '-':
-                og_p = soup.find('meta', property='product:price:amount')
+                og_p = soup.find('meta', property='product:price:amount') or soup.find('meta', property='og:price:amount')
                 if og_p and og_p.get('content'): p['price'] = format_price_string(og_p['content'])
 
-            if not p.get('imageUrl'):
-                img = soup.find('meta', property='og:image')
-                if img and img.get('content'): p['imageUrl'] = img['content']
+            if not p.get('imageUrl') or not is_valid_image(p.get('imageUrl')):
+                img = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
+                if img and img.get('content') and is_valid_image(img['content']):
+                    p['imageUrl'] = img['content']
 
     except Exception: pass
     return p
@@ -279,21 +287,19 @@ def enrich_products_parallel(session, products, shop_key):
             for f in futures:
                 try: f.result()
                 except Exception: pass
-               
-    # QUALITÄTSFILTER: Lösche Produkte, die Müll sind (Weder Preis noch Bild)
-    clean_products = []
+
+    # Reinige ungültige Bilder (z.B. Biber-Logos) nachträglich heraus
     for p in products:
-        if p['price'] != '-' or (p['imageUrl'] != '' and 'http' in p['imageUrl']):
-            clean_products.append(p)
+        if not is_valid_image(p.get('imageUrl')):
+            p['imageUrl'] = ""
            
-    return clean_products
+    return products
 
 
 # ===================================================================
-# SHOP-ROUTINEN (Mit strengen URL-Validatoren)
+# SHOP-ROUTINEN (Saubere URL-Validierung ohne Über-Filtering)
 # ===================================================================
 def scrape_amazon(session, keyword):
-    # Amazon bleibt unverändert, da es gut funktioniert.
     products = []
     try:
         url = f"https://www.amazon.de/s?k={urllib.parse.quote(keyword)}&s=exact-aware-popularity-rank"
@@ -336,19 +342,13 @@ def scrape_generic(session, shop_key, domain, keyword):
         if domain not in l: return False
         if l.rstrip('/').endswith(domain): return False
        
-        # Strenge Pfad-Filter, um Kategorien komplett auszusperren!
-        if shop_key == 'ikea' and '/p/' not in l: return False
-        if shop_key == 'netto' and '/p/' not in l and '/artikel/' not in l: return False
-        if shop_key == 'decathlon' and '/p/' not in l: return False
-        if shop_key == 'hm' and 'productpage' not in l: return False
-        if shop_key == 'obi' and '/p/' not in l: return False
-        if shop_key == 'bauhaus' and '/p/' not in l and '/produkt/' not in l: return False
-        if shop_key == 'otto' and '/p/' not in l and '#variationid=' not in l: return False
-        if shop_key == 'kaufland' and '/product/' not in l and '/item/' not in l: return False
-        if shop_key == 'cna' and '/product/' not in l and '/shop/' not in l: return False
-       
-        # Generische Ausschlüsse
-        if any(b in l for b in ['/impressum', '/datenschutz', '/agb', '/login', '/cart', '/konto', '/service', '/help', '/cat/', '/kategorien/', '/blog/']): return False
+        # Generische Ausschlüsse (Kategorien, Service, etc.)
+        if any(b in l for b in ['/impressum', '/datenschutz', '/agb', '/login', '/cart', '/konto', '/service', '/help', '/blog/']):
+            return False
+           
+        # Shop-spezifische Filter
+        if shop_key == 'jysk' and len([p for p in urllib.parse.urlparse(l).path.split('/') if p]) < 2: return False
+        if shop_key == 'ikea' and not any(p in l for p in ['/p/', '/pe', '/art/']): return False
         return True
 
     products = []
@@ -360,9 +360,9 @@ def scrape_generic(session, shop_key, domain, keyword):
             products = extract_product_tiles(res.content.decode('utf-8', 'ignore'), domain, valid_generic)
     except Exception: pass
 
-    # Wenn der Scraper nichts findet, feuere die verbesserte Suchmaschinen-Flotte ab
+    # Bei wenigen Treffern Fallback-Suchmaschinen aktivieren
     if len(products) < 10:
-        products.extend(execute_external_search(session, domain, keyword, valid_generic, shop_key))
+        products.extend(execute_external_search(session, domain, keyword, valid_generic))
 
     return enrich_products_parallel(session, deduplicate(products)[:MAX_RESULTS], shop_key)
 
@@ -372,7 +372,7 @@ def scrape_generic(session, shop_key, domain, keyword):
 # ===================================================================
 SHOP_DOMAINS = {
     'amazon': 'amazon.de', 'norma': 'norma24.de', 'netto': 'netto-online.de',
-    'obi': 'obi.de', 'hm': 'www2.hm.com', 'ikea': 'ikea.com', 'jysk': 'jysk.de',
+    'obi': 'obi.de', 'hm': 'hm.com', 'ikea': 'ikea.com', 'jysk': 'jysk.de',
     'kaufland': 'kaufland.de', 'otto': 'otto.de', 'smythtoys': 'smythstoys.com',
     'decathlon': 'decathlon.de', 'cna': 'c-and-a.com', 'bauhaus': 'bauhaus.info'
 }
