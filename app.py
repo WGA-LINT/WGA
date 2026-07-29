@@ -14,11 +14,11 @@ except ImportError:
 app = Flask(__name__)
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
     'Accept-Language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Encoding': 'gzip, deflate, br',
-    'Sec-Ch-Ua': '"Not-A.Brand";v="99", "Chromium";v="124", "Google Chrome";v="124"',
+    'Sec-Ch-Ua': '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
     'Sec-Ch-Ua-Mobile': '?0',
     'Sec-Ch-Ua-Platform': '"Windows"',
     'Sec-Fetch-Dest': 'document',
@@ -44,6 +44,16 @@ SHOP_DOMAINS = {
     'bauhaus': 'bauhaus.info'
 }
 
+JUNK_TITLE_PATTERNS = [
+    r'^info zu diesem artikel',
+    r'^wareninformationen',
+    r'^amazon\.de',
+    r'^präzises design',
+    r'^produktbeschreibung',
+    r'^kundenrezensionen',
+    r'^details'
+]
+
 def get_session():
     if HAS_CURL:
         session = crequests.Session(impersonate="chrome120")
@@ -51,6 +61,10 @@ def get_session():
         session = crequests.Session()
     session.headers.update(HEADERS)
     return session
+
+def get_amazon_image_url(asin):
+    # Zuverlässige Amazon-Bild-API (funktioniert für jede ASIN in Google Sheets)
+    return f"https://ws-eu.amazon-adsystem.com/widgets/q?_encoding=UTF-8&ASIN={asin}&Format=_SL300_&ID=AsinImage&MarketPlace=DE&ServiceVersion=20070822&WS=1"
 
 @app.route('/')
 def home():
@@ -75,15 +89,15 @@ def scrape():
     session = get_session()
     products = []
 
-    # Strategie 1: Direktes Amazon Scraping mit Cookie-Warmup
+    # Strategie 1: Direktes Amazon Scraping
     if shop_key == 'amazon':
         try:
             products = scrape_amazon_direct(session, keyword)
         except Exception as e:
             print(f"Direct Amazon Error: {e}")
 
-    # Strategie 2: DuckDuckGo HTML Fallback
-    if len(products) < 5:
+    # Strategie 2: DuckDuckGo Fallback (erweitert für bis zu 30 Produkte)
+    if len(products) < 25:
         try:
             ddg_prods = search_ddg_html(session, target_domain, keyword, shop_key)
             products.extend(ddg_prods)
@@ -92,7 +106,7 @@ def scrape():
             print(f"DDG Error: {e}")
 
     # Strategie 3: Bing Fallback
-    if len(products) < 5:
+    if len(products) < 25:
         try:
             bing_prods = search_bing(session, target_domain, keyword, shop_key)
             products.extend(bing_prods)
@@ -115,21 +129,23 @@ def scrape():
 def scrape_amazon_direct(session, keyword):
     products = []
    
-    # 1. Cookie Handshake (Startseite laden, um Cookies wie session-id zu sammeln)
+    # 1. Warmup Session
     try:
         session.get("https://www.amazon.de", timeout=5)
     except Exception:
         pass
 
-    # 2. Suchanfrage senden
-    url = f"https://www.amazon.de/s?k={urllib.parse.quote(keyword)}"
+    # 2. Realistische Amazon Such-URL
+    url = f"https://www.amazon.de/s?k={urllib.parse.quote(keyword)}&ref=nb_sb_noss"
     res = session.get(url, timeout=10)
    
     if res.status_code != 200 or "captcha" in res.text.lower():
         print("Amazon direct blocked or CAPTCHA triggered.")
         return products
 
-    soup = BeautifulSoup(res.text, 'html.parser')
+    # UTF-8 Dekodierung erzwingen
+    html_content = res.content.decode('utf-8', 'ignore')
+    soup = BeautifulSoup(html_content, 'html.parser')
     items = soup.find_all('div', {'data-component-type': 's-search-result'})
    
     if not items:
@@ -145,11 +161,13 @@ def scrape_amazon_direct(session, keyword):
             continue
 
         title = title_tag.get_text().strip()
-        if not title:
+        if not title or is_junk_title(title):
             continue
 
         link = f"https://www.amazon.de/dp/{asin}"
-        img_url = f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX300_.jpg"
+       
+        img_tag = item.select_one('img.s-image')
+        img_url = img_tag['src'] if img_tag and img_tag.has_attr('src') else get_amazon_image_url(asin)
 
         price = "-"
         price_tag = item.select_one('.a-price .a-offscreen')
@@ -174,57 +192,67 @@ def scrape_amazon_direct(session, keyword):
 
 def search_ddg_html(session, domain, keyword, shop_key):
     products = []
-    query = f"site:{domain} {keyword}" if shop_key != 'amazon' else f"site:amazon.de/dp/ {keyword}"
-   
-    url = "https://html.duckduckgo.com/html/"
-    data = {'q': query}
-   
-    res = session.post(url, data=data, timeout=10)
-    if res.status_code == 200:
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for a in soup.select('a.result__url'):
-            link = a.get('href', '')
-            if 'uddg=' in link:
-                match = re.search(r'uddg=([^&]+)', link)
-                if match:
-                    link = urllib.parse.unquote(match.group(1))
+    queries = [
+        f"site:{domain}/dp/ {keyword}" if shop_key == 'amazon' else f"site:{domain} {keyword}",
+        f"site:{domain} {keyword} kaufen" if shop_key == 'amazon' else f"site:{domain} {keyword} produkt"
+    ]
 
-            if not is_valid_url(link, domain):
-                continue
+    for q in queries:
+        url = "https://html.duckduckgo.com/html/"
+        data = {'q': q}
+       
+        res = session.post(url, data=data, timeout=10)
+        if res.status_code == 200:
+            html_text = res.content.decode('utf-8', 'ignore')
+            soup = BeautifulSoup(html_text, 'html.parser')
+           
+            for a in soup.select('a.result__url'):
+                link = a.get('href', '')
+                if 'uddg=' in link:
+                    match = re.search(r'uddg=([^&]+)', link)
+                    if match:
+                        link = urllib.parse.unquote(match.group(1))
 
-            parent = a.find_parent('div', class_='result__body')
-            title = ""
-            desc = ""
-            if parent:
-                t_elem = parent.select_one('a.result__snippet') or parent.select_one('h2')
-                if t_elem:
-                    title = clean_title(t_elem.get_text())
-                desc = parent.get_text()
+                if not is_valid_url(link, domain):
+                    continue
 
-            if not title:
-                title = clean_title(a.get_text())
+                parent = a.find_parent('div', class_='result__body')
+                title = ""
+                desc = ""
+                if parent:
+                    t_elem = parent.select_one('a.result__snippet') or parent.select_one('h2') or parent.select_one('.result__title')
+                    if t_elem:
+                        title = clean_title(t_elem.get_text())
+                    desc = parent.get_text()
 
-            if not title:
-                continue
+                if not title:
+                    title = clean_title(a.get_text())
 
-            price = extract_price(desc)
-            products.append({
-                "title": title,
-                "price": price,
-                "imageUrl": "",
-                "link": link.split('?')[0]
-            })
+                if not title or is_junk_title(title):
+                    continue
+
+                price = extract_price(desc)
+                products.append({
+                    "title": title,
+                    "price": price,
+                    "imageUrl": "",
+                    "link": link.split('?')[0]
+                })
+        if len(products) >= 30:
+            break
+
     return products
 
 
 def search_bing(session, domain, keyword, shop_key):
     products = []
-    query = f"site:{domain} {keyword}" if shop_key != 'amazon' else f"site:amazon.de/dp/ {keyword}"
+    query = f"site:{domain}/dp/ {keyword}" if shop_key == 'amazon' else f"site:{domain} {keyword}"
     url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
    
     res = session.get(url, timeout=10)
     if res.status_code == 200:
-        soup = BeautifulSoup(res.text, 'html.parser')
+        html_text = res.content.decode('utf-8', 'ignore')
+        soup = BeautifulSoup(html_text, 'html.parser')
         for item in soup.select('li.b_algo'):
             a = item.find('a', href=True)
             if not a:
@@ -234,7 +262,7 @@ def search_bing(session, domain, keyword, shop_key):
                 continue
 
             title = clean_title(a.get_text())
-            if not title:
+            if not title or is_junk_title(title):
                 continue
 
             price = extract_price(item.get_text())
@@ -245,6 +273,16 @@ def search_bing(session, domain, keyword, shop_key):
                 "link": link.split('?')[0]
             })
     return products
+
+
+def is_junk_title(title):
+    t = title.strip().lower()
+    if len(t) < 8:
+        return True
+    for pattern in JUNK_TITLE_PATTERNS:
+        if re.search(pattern, t):
+            return True
+    return False
 
 
 def is_valid_url(url, domain):
@@ -296,8 +334,8 @@ def enrich_products(products, shop_key):
             if asin_match:
                 asin = asin_match.group(1).upper()
                 p['link'] = f"https://www.amazon.de/dp/{asin}"
-                if not p['imageUrl']:
-                    p['imageUrl'] = f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX300_.jpg"
+                if not p['imageUrl'] or 'images-na' in p['imageUrl']:
+                    p['imageUrl'] = get_amazon_image_url(asin)
     return products
 
 
