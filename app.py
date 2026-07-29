@@ -59,7 +59,7 @@ def deduplicate(products):
 
 
 # ===================================================================
-# GEMEINSAMER METADATEN-ENRICHER (Repariert Bilder und Preise!)
+# METADATEN-ENRICHER
 # ===================================================================
 def enrich_single_product(p, session, shop_key):
     if p.get('imageUrl') and p.get('price') != '-': return p
@@ -78,7 +78,7 @@ def enrich_single_product(p, session, shop_key):
                 if og_img and og_img.get('content'):
                     img_url = og_img['content']
                 else:
-                    img_tag = soup.find('img', itemprop='image') or soup.find('img', class_=re.compile(r'product.*image|main-image', re.I))
+                    img_tag = soup.find('img', itemprop='image') or soup.find('img', class_=re.compile(r'product.*image|main-image|pdp', re.I))
                     if img_tag and img_tag.get('src'): img_url = img_tag['src']
                
                 if not img_url:
@@ -100,12 +100,9 @@ def enrich_single_product(p, session, shop_key):
                     prop = soup.find(attrs={"itemprop": "price"})
                     if prop: p['price'] = format_price_string(prop.get("content") or prop.get_text())
                 if p.get('price') == '-':
-                    for s in soup.find_all('script'):
-                        if s.string:
-                            m = re.search(r'["\']price["\']\s*:\s*["\']?(\d+[\.,]\d{2})["\']?', s.string)
-                            if m:
-                                p['price'] = format_price_string(m.group(1))
-                                break
+                    # Erweiterter JSON / HTML Regex-Search
+                    m_p = re.search(r'["\']price["\']\s*:\s*["\']?(\d+[\.,]\d{2})["\']?', html)
+                    if m_p: p['price'] = format_price_string(m_p.group(1))
     except Exception:
         pass
     return p
@@ -122,13 +119,12 @@ def enrich_products_parallel(session, products, shop_key):
 
 
 # ===================================================================
-# 100% ISOLIERTE SHOP-ROUTINEN (Mit Direkt-Suche Bypass!)
+# ISOLIERTE SHOP-ROUTINEN
 # ===================================================================
 
+# 1. AMAZON (Erweiterte Preis-Scans)
 def scrape_amazon(session, keyword):
     products = []
-   
-    # 1. Direkter Aufruf
     try:
         session.get("https://www.amazon.de", timeout=4)
         res = session.get(f"https://www.amazon.de/s?k={urllib.parse.quote(keyword)}&ref=nb_sb_noss", timeout=8)
@@ -140,11 +136,12 @@ def scrape_amazon(session, keyword):
                 title_tag = item.select_one('h2 a span') or item.select_one('h2 span')
                 if not title_tag: continue
                
-                # REPARIERT: Robuster Preis-Fallback für Amazon!
+                item_str = str(item)
                 price = "-"
+               
                 p_elem = item.select_one('.a-price .a-offscreen') or item.select_one('span.a-price') or item.select_one('.a-color-price')
-                if p_elem:
-                    price = format_price_string(p_elem.get_text())
+                if p_elem: price = format_price_string(p_elem.get_text())
+               
                 if price == "-":
                     p_w = item.select_one('.a-price-whole')
                     p_f = item.select_one('.a-price-fraction')
@@ -152,33 +149,32 @@ def scrape_amazon(session, keyword):
                         w_text = re.sub(r'[^\d]', '', p_w.get_text())
                         f_text = re.sub(r'[^\d]', '', p_f.get_text()) if p_f else '00'
                         if w_text: price = f"{w_text},{f_text} €"
+               
+                if price == "-":
+                    m_pr = re.search(r'(\d{1,4}[.,]\d{2})\s*€', item_str)
+                    if m_pr: price = f"{m_pr.group(1).replace('.', ',')} €"
 
                 img_tag = item.select_one('img.s-image')
                 img_url = img_tag['src'] if img_tag and img_tag.has_attr('src') else get_amazon_image_url(asin)
                 products.append({"title": title_tag.get_text().strip(), "price": price, "imageUrl": img_url, "link": f"https://www.amazon.de/dp/{asin}"})
     except Exception: pass
 
-    # 2. Yahoo Fallback für Amazon (Falls direkt geblockt)
     if len(products) < 20:
         valid_az = lambda u: bool(re.search(r'/(dp|gp/product)/[a-z0-9]{10}', u, re.I) or re.search(r'/[a-z0-9]{10}(?:[/?]|$)', u, re.I))
-        queries = [f"amazon.de {keyword}", f"site:amazon.de {keyword}"]
-        for q in queries:
-            try:
-                res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote(q)}", timeout=8)
-                if res.status_code == 200:
-                    soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
-                    for div in soup.find_all('div', class_='algo'):
-                        a = div.find('a', href=True)
-                        if not a: continue
-                        link = a['href']
-                        if 'RU=' in link: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
-                        link = link.split('?')[0]
-                        if valid_az(link):
-                            products.append({"title": re.sub(r'\s*[:|-|•]\s*.*$', '', a.get_text(strip=True)).strip(), "price": "-", "imageUrl": "", "link": link})
-            except Exception: pass
-            if len(products) >= 20: break
+        try:
+            res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote('site:amazon.de/dp/ ' + keyword)}", timeout=8)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
+                for div in soup.find_all('div', class_='algo'):
+                    a = div.find('a', href=True)
+                    if not a: continue
+                    link = a['href']
+                    if 'RU=' in link: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
+                    link = link.split('?')[0]
+                    if valid_az(link):
+                        products.append({"title": re.sub(r'\s*[:|-|•]\s*.*$', '', a.get_text(strip=True)).strip(), "price": "-", "imageUrl": "", "link": link})
+        except Exception: pass
 
-    # ASIN Bilder reparieren
     for p in products:
         m = re.search(r'/[a-z0-9]{10}', p['link'], re.I)
         if m and not p.get('imageUrl'):
@@ -188,32 +184,86 @@ def scrape_amazon(session, keyword):
     return enrich_products_parallel(session, deduplicate(products)[:30], 'amazon')
 
 
+# 2. NORMA (Gefilterte URLs & Titel gegen Navigations-Müll)
 def scrape_norma(session, keyword):
     products = []
-    valid_url = lambda u: 'norma24.de' in u and '/kategorie/' not in u and not u.rstrip('/').endswith(('norma24.de', 'norma24.de/de'))
    
-    # 1. NEU: Direkte Shop-Suche (Umgeht jede Suchmaschinen-Sperre)
+    def is_valid_norma(url, title):
+        u_low = url.lower()
+        t_low = title.lower()
+       
+        # Blockliste für Navigations-Links und Aktionen
+        block_keywords = ['anmelden', 'übersicht', 'bestellungen', 'mein konto', 'warenkorb', 'kategorie', 'aktionen', 'service', 'filialen', 'newsletter', 'kontakt']
+        if any(b in t_low for b in block_keywords) or any(b in u_low for b in block_keywords):
+            return False
+       
+        if u_low.rstrip('/').endswith(('norma24.de', 'norma24.de/de')):
+            return False
+           
+        return len(t_low) >= 8
+
     try:
-        res = session.get(f"https://www.norma24.de/suche/?q={urllib.parse.quote(keyword)}", timeout=8)
+        res = session.get(f"https://www.norma24.de/suche?q={urllib.parse.quote(keyword)}", timeout=8)
         if res.status_code == 200:
             soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
             for a in soup.find_all('a', href=True):
                 link = a['href']
                 if link.startswith('/'): link = "https://www.norma24.de" + link
+               
+                title = a.get_text(strip=True)
+                if not title or len(title) < 5:
+                    img = a.find('img')
+                    if img and img.get('alt'): title = img.get('alt')
+               
+                title = re.sub(r'\s+', ' ', title).strip()
+                if is_valid_norma(link, title):
+                    products.append({"title": title, "price": "-", "imageUrl": "", "link": link.split('?')[0]})
+    except Exception: pass
+
+    if len(products) < 10:
+        try:
+            res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote('site:norma24.de/ ' + keyword)}", timeout=8)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
+                for div in soup.find_all('div', class_='algo'):
+                    a = div.find('a', href=True)
+                    if not a: continue
+                    link = a['href']
+                    if 'RU=' in link: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
+                    link = link.split('?')[0]
+                    title = re.sub(r'\s*[:|-|•]\s*.*$', '', a.get_text(strip=True)).strip()
+                    if is_valid_norma(link, title):
+                        products.append({"title": title, "price": "-", "imageUrl": "", "link": link})
+        except Exception: pass
+
+    return enrich_products_parallel(session, deduplicate(products)[:30], 'norma')
+
+
+# 3. NETTO (Angepasste Such-URL & Fallback)
+def scrape_netto(session, keyword):
+    products = []
+    valid_url = lambda u: 'netto-online.de' in u and ('/p-' in u or '/p/' in u or '/artikel/' in u or u.endswith('.html')) and '/filialen' not in u
+   
+    try:
+        res = session.get(f"https://www.netto-online.de/s/?query={urllib.parse.quote(keyword)}", timeout=8)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
+            for a in soup.find_all('a', href=True):
+                link = a['href']
+                if link.startswith('/'): link = "https://www.netto-online.de" + link
                 if valid_url(link):
                     title = a.get_text(strip=True)
                     if not title or len(title) < 5:
                         img = a.find('img')
                         if img and img.get('alt'): title = img.get('alt')
                     title = re.sub(r'\s+', ' ', title).strip()
-                    if len(title) > 5 and 'norma24 online-shop' not in title.lower():
+                    if len(title) > 5:
                         products.append({"title": title, "price": "-", "imageUrl": "", "link": link.split('?')[0]})
     except Exception: pass
 
-    # 2. Yahoo Fallback
     if len(products) < 10:
         try:
-            res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote('site:norma24.de ' + keyword)}", timeout=8)
+            res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote('site:netto-online.de ' + keyword)}", timeout=8)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
                 for div in soup.find_all('div', class_='algo'):
@@ -223,115 +273,59 @@ def scrape_norma(session, keyword):
                     if 'RU=' in link: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
                     link = link.split('?')[0]
                     if valid_url(link):
-                        title = re.sub(r'\s*[:|-|•]\s*.*$', '', a.get_text(strip=True)).strip()
-                        if 'norma24 online-shop' not in title.lower():
-                            products.append({"title": title, "price": "-", "imageUrl": "", "link": link})
+                        products.append({"title": re.sub(r'\s*[:|-|•]\s*.*$', '', a.get_text(strip=True)).strip(), "price": "-", "imageUrl": "", "link": link})
         except Exception: pass
-
-    return enrich_products_parallel(session, deduplicate(products)[:30], 'norma')
-
-
-def scrape_netto(session, keyword):
-    products = []
-    valid_url = lambda u: 'netto-online.de' in u and ('/p-' in u or '/p/' in u or '/artikel/' in u or u.endswith('.html')) and '/filialen' not in u
-   
-    # 1. NEU: Direkte Shop-Suche
-    try:
-        res = session.get(f"https://www.netto-online.de/search?q={urllib.parse.quote(keyword)}", timeout=8)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
-            for a in soup.find_all('a', href=True):
-                link = a['href']
-                if link.startswith('/'): link = "https://www.netto-online.de" + link
-                if valid_url(link):
-                    title = ""
-                    for tag in ['h2', 'h3', 'span']:
-                        elem = a.find(tag)
-                        if elem and len(elem.get_text(strip=True)) > 10:
-                            title = elem.get_text(strip=True)
-                            break
-                    if not title: title = a.get_text(strip=True)
-                    title = re.sub(r'\s+', ' ', title).strip()
-                    if len(title) > 5:
-                        products.append({"title": title, "price": "-", "imageUrl": "", "link": link.split('?')[0]})
-    except Exception: pass
-
-    # 2. Yahoo Fallback
-    if len(products) < 10:
-        queries = [f"netto-online.de {keyword}", f"site:netto-online.de {keyword}"]
-        for q in queries:
-            try:
-                res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote(q)}", timeout=8)
-                if res.status_code == 200:
-                    soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
-                    for div in soup.find_all('div', class_='algo'):
-                        a = div.find('a', href=True)
-                        if not a: continue
-                        link = a['href']
-                        if 'RU=' in link: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
-                        link = link.split('?')[0]
-                        if valid_url(link):
-                            products.append({"title": re.sub(r'\s*[:|-|•]\s*.*$', '', a.get_text(strip=True)).strip(), "price": "-", "imageUrl": "", "link": link})
-            except Exception: pass
-            if len(products) >= 20: break
 
     return enrich_products_parallel(session, deduplicate(products)[:30], 'netto')
 
 
+# 4. KAUFLAND (Kaufland Standard-Suche)
 def scrape_kaufland(session, keyword):
     products = []
     valid_url = lambda u: 'kaufland.de' in u and ('/product/' in u or '/item/' in u or '/pdp/' in u)
    
-    # 1. NEU: Direkte Shop-Suche
     try:
-        res = session.get(f"https://www.kaufland.de/item/search/?search_value={urllib.parse.quote(keyword)}", timeout=8)
+        res = session.get(f"https://www.kaufland.de/s/?search_value={urllib.parse.quote(keyword)}", timeout=8)
         if res.status_code == 200:
             soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
             for a in soup.find_all('a', href=True):
                 link = a['href']
                 if link.startswith('/'): link = "https://www.kaufland.de" + link
                 if valid_url(link):
-                    title = ""
-                    for tag in ['h2', 'h3', 'span']:
-                        elem = a.find(tag)
-                        if elem and len(elem.get_text(strip=True)) > 10:
-                            title = elem.get_text(strip=True)
-                            break
-                    if not title: title = a.get_text(strip=True)
+                    title = a.get_text(strip=True)
+                    if not title or len(title) < 5:
+                        img = a.find('img')
+                        if img and img.get('alt'): title = img.get('alt')
                     title = re.sub(r'\s+', ' ', title).strip()
-                    if len(title) > 5 and 'kidland' not in title.lower() and 'eigenmarke' not in title.lower():
+                    if len(title) > 5 and 'kidland' not in title.lower():
                         products.append({"title": title, "price": "-", "imageUrl": "", "link": link.split('?')[0]})
     except Exception: pass
 
-    # 2. Yahoo Fallback
     if len(products) < 10:
-        queries = [f"kaufland.de {keyword}", f"site:kaufland.de {keyword}"]
-        for q in queries:
-            try:
-                res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote(q)}", timeout=8)
-                if res.status_code == 200:
-                    soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
-                    for div in soup.find_all('div', class_='algo'):
-                        a = div.find('a', href=True)
-                        if not a: continue
-                        link = a['href']
-                        if 'RU=' in link: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
-                        link = link.split('?')[0]
-                        if valid_url(link):
-                            t = re.sub(r'\s*[:|-|•]\s*.*$', '', a.get_text(strip=True)).strip()
-                            if 'kidland' not in t.lower() and 'eigenmarke' not in t.lower():
-                                products.append({"title": t, "price": "-", "imageUrl": "", "link": link})
-            except Exception: pass
-            if len(products) >= 20: break
+        try:
+            res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote('site:kaufland.de ' + keyword)}", timeout=8)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
+                for div in soup.find_all('div', class_='algo'):
+                    a = div.find('a', href=True)
+                    if not a: continue
+                    link = a['href']
+                    if 'RU=' in link: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
+                    link = link.split('?')[0]
+                    if valid_url(link):
+                        t = re.sub(r'\s*[:|-|•]\s*.*$', '', a.get_text(strip=True)).strip()
+                        if 'kidland' not in t.lower():
+                            products.append({"title": t, "price": "-", "imageUrl": "", "link": link})
+        except Exception: pass
 
     return enrich_products_parallel(session, deduplicate(products)[:30], 'kaufland')
 
 
+# 5. OTTO (Erweitertes Parsing für Preise & Bilder)
 def scrape_otto(session, keyword):
     products = []
     valid_url = lambda u: 'otto.de' in u and ('/p/' in u or '#variationid=' in u or '/pdp/' in u)
    
-    # 1. NEU: Direkte Shop-Suche
     try:
         res = session.get(f"https://www.otto.de/suche/{urllib.parse.quote(keyword)}/", timeout=8)
         if res.status_code == 200:
@@ -349,35 +343,31 @@ def scrape_otto(session, keyword):
                         products.append({"title": title, "price": "-", "imageUrl": "", "link": link.split('?')[0]})
     except Exception: pass
 
-    # 2. Yahoo Fallback
     if len(products) < 10:
-        queries = [f"otto.de {keyword}", f"site:otto.de {keyword}"]
-        for q in queries:
-            try:
-                res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote(q)}", timeout=8)
-                if res.status_code == 200:
-                    soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
-                    for div in soup.find_all('div', class_='algo'):
-                        a = div.find('a', href=True)
-                        if not a: continue
-                        link = a['href']
-                        if 'RU=' in link: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
-                        link = link.split('?')[0]
-                        if valid_url(link):
-                            products.append({"title": re.sub(r'\s*[:|-|•]\s*.*$', '', a.get_text(strip=True)).strip(), "price": "-", "imageUrl": "", "link": link})
-            except Exception: pass
-            if len(products) >= 20: break
+        try:
+            res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote('site:otto.de/p/ ' + keyword)}", timeout=8)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
+                for div in soup.find_all('div', class_='algo'):
+                    a = div.find('a', href=True)
+                    if not a: continue
+                    link = a['href']
+                    if 'RU=' in link: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
+                    link = link.split('?')[0]
+                    if valid_url(link):
+                        products.append({"title": re.sub(r'\s*[:|-|•]\s*.*$', '', a.get_text(strip=True)).strip(), "price": "-", "imageUrl": "", "link": link})
+        except Exception: pass
 
     return enrich_products_parallel(session, deduplicate(products)[:30], 'otto')
 
 
+# 6. SMYTH TOYS (Angepasster DE-Suchpfad)
 def scrape_smythtoys(session, keyword):
     products = []
     valid_url = lambda u: 'smythstoys.com' in u and ('/p/' in u or '/product/' in u or re.search(r'\d{5,}', u))
    
-    # 1. NEU: Direkte Shop-Suche
     try:
-        res = session.get(f"https://www.smythstoys.com/de/de-de/search/?text={urllib.parse.quote(keyword)}", timeout=8)
+        res = session.get(f"https://www.smythstoys.com/de/de-de/search?text={urllib.parse.quote(keyword)}", timeout=8)
         if res.status_code == 200:
             soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
             for a in soup.find_all('a', href=True):
@@ -393,7 +383,6 @@ def scrape_smythtoys(session, keyword):
                         products.append({"title": title, "price": "-", "imageUrl": "", "link": link.split('?')[0]})
     except Exception: pass
 
-    # 2. Yahoo Fallback
     if len(products) < 10:
         try:
             res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote('site:smythstoys.com ' + keyword)}", timeout=8)
@@ -416,7 +405,6 @@ def scrape_generic(session, shop_key, domain, keyword):
     products = []
     valid_url = lambda u: domain in u and not u.rstrip('/').endswith(domain) and '/impressum' not in u
    
-    # Generic Shops haben keine bekannte Direct-Search, also sofort Yahoo
     try:
         res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote('site:' + domain + ' ' + keyword)}", timeout=8)
         if res.status_code == 200:
