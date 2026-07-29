@@ -59,7 +59,7 @@ def deduplicate(products):
 
 
 # ===================================================================
-# SUCH-HELFER (Strikte POST-Requests, damit DuckDuckGo nicht blockiert)
+# SUCH-HELFER (UNANGETASTET)
 # ===================================================================
 def execute_ddg_search(session, query, valid_url_func):
     products = []
@@ -103,7 +103,7 @@ def execute_bing_search(session, query, valid_url_func):
 
 
 # ===================================================================
-# VOLLSTÄNDIGER METADATEN-ENRICHER (Repariert Links & sucht tief)
+# VOLLSTÄNDIGER METADATEN-ENRICHER (UNANGETASTET)
 # ===================================================================
 def enrich_single_product(p, session, shop_key):
     if p.get('imageUrl') and p.get('price') != '-': return p
@@ -115,7 +115,7 @@ def enrich_single_product(p, session, shop_key):
             html = res.content.decode('utf-8', 'ignore')
             soup = BeautifulSoup(html, 'html.parser')
 
-            # 1. BILDER (Mit Wiederherstellung der Reparatur relativer Links!)
+            # 1. BILDER
             if not p.get('imageUrl'):
                 img_url = ""
                 og_img = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
@@ -130,7 +130,6 @@ def enrich_single_product(p, session, shop_key):
                     if m: img_url = m.group(1)
 
                 if img_url:
-                    # HIER WAR DER FEHLER: Das Reparieren der Shop-Links fehlte im letzten Update
                     if img_url.startswith('//'):
                         img_url = 'https:' + img_url
                     elif img_url.startswith('/'):
@@ -138,7 +137,7 @@ def enrich_single_product(p, session, shop_key):
                         img_url = f"{parsed.scheme}://{parsed.netloc}{img_url}"
                     p['imageUrl'] = img_url
 
-            # 2. PREISE (Mit allen Fallbacks für Netto, Kaufland & Co.)
+            # 2. PREISE
             if p.get('price') == '-':
                 og_p = soup.find('meta', property='product:price:amount') or soup.find('meta', property='og:price:amount')
                 if og_p and og_p.get('content'):
@@ -169,11 +168,11 @@ def enrich_products_parallel(session, products, shop_key):
                 except Exception: pass
     return products
 
-
 # ===================================================================
-# ISOLIERTE SHOP-ROUTINEN (Jeder Shop hat eigene, sichere Regeln)
+# ISOLIERTE SHOP-ROUTINEN
 # ===================================================================
 
+# ---> ANGEPASST: Amazon (Pfade aus Suchoperator entfernt)
 def scrape_amazon(session, keyword):
     products = []
    
@@ -209,24 +208,28 @@ def scrape_amazon(session, keyword):
     except Exception:
         pass
 
-    # 2. DuckDuckGo Fallback (Fehlte im letzten Update!)
+    # 2. Fallbacks (Mit breiter Suche, Python filtert die echten Links via valid_az)
     if len(products) < 20:
-        valid_az = lambda u: bool(re.search(r'/(dp|gp/product)/[a-z0-9]{10}', u, re.I))
-        products.extend(execute_ddg_search(session, f"site:amazon.de/dp/ {keyword}", valid_az))
-   
-    # 3. Bing Fallback
-    if len(products) < 20:
-        valid_az = lambda u: bool(re.search(r'/(dp|gp/product)/[a-z0-9]{10}', u, re.I))
-        products.extend(execute_bing_search(session, f"site:amazon.de/dp/ {keyword}", valid_az))
+        valid_az = lambda u: bool(re.search(r'/(dp|gp/product)/[a-z0-9]{10}', u, re.I) or re.search(r'/[a-z0-9]{10}(?:[/?]|$)', u, re.I))
+        products.extend(execute_ddg_search(session, f"amazon.de {keyword}", valid_az))
+        if len(products) < 20:
+            products.extend(execute_ddg_search(session, f"site:amazon.de {keyword}", valid_az))
+        if len(products) < 20:
+            products.extend(execute_bing_search(session, f"amazon.de {keyword}", valid_az))
+        if len(products) < 20:
+            products.extend(execute_bing_search(session, f"site:amazon.de {keyword}", valid_az))
 
-    # ASIN Bilder reparieren bevor Enricher startet
+    # ASIN Bilder reparieren, falls beim Fallback das Bild fehlte
     for p in products:
-        m = re.search(r'/dp/([A-Z0-9]{10})', p['link'], re.I)
-        if m and not p.get('imageUrl'): p['imageUrl'] = get_amazon_image_url(m.group(1).upper())
+        m = re.search(r'/[a-z0-9]{10}', p['link'], re.I)
+        if m and not p.get('imageUrl'):
+            asin_cand = m.group(0).strip('/').upper()
+            if len(asin_cand) == 10: p['imageUrl'] = get_amazon_image_url(asin_cand)
 
     return enrich_products_parallel(session, deduplicate(products)[:30], 'amazon')
 
 
+# ---> UNANGETASTET: Norma (Funktioniert perfekt)
 def scrape_norma(session, keyword):
     valid_url = lambda u: 'norma24.de' in u and '/kategorie/' not in u and not u.rstrip('/').endswith(('norma24.de', 'norma24.de/de'))
     products = execute_ddg_search(session, f"site:norma24.de {keyword}", valid_url)
@@ -238,17 +241,27 @@ def scrape_norma(session, keyword):
     return enrich_products_parallel(session, deduplicate(filtered)[:30], 'norma')
 
 
+# ---> ANGEPASST: Netto (Breitere Suche + Python-Filter für Produktlinks)
 def scrape_netto(session, keyword):
-    valid_url = lambda u: 'netto-online.de' in u and ('/p-' in u or '/p/' in u or '/artikel/' in u)
-    products = execute_ddg_search(session, f"site:netto-online.de {keyword}", valid_url)
+    valid_url = lambda u: 'netto-online.de' in u and ('/p-' in u or '/p/' in u or '/artikel/' in u or u.endswith('.html')) and '/filialen' not in u
+    products = execute_ddg_search(session, f"netto-online.de {keyword}", valid_url)
+    if len(products) < 20:
+        products.extend(execute_ddg_search(session, f"site:netto-online.de {keyword}", valid_url))
+    if len(products) < 20:
+        products.extend(execute_bing_search(session, f"netto-online.de {keyword}", valid_url))
     if len(products) < 20:
         products.extend(execute_bing_search(session, f"site:netto-online.de {keyword}", valid_url))
     return enrich_products_parallel(session, deduplicate(products)[:30], 'netto')
 
 
+# ---> ANGEPASST: Kaufland (Breitere Suche + Python-Filter für Produktlinks)
 def scrape_kaufland(session, keyword):
-    valid_url = lambda u: 'kaufland.de' in u and ('/product/' in u or '/item/' in u)
-    products = execute_ddg_search(session, f"site:kaufland.de {keyword}", valid_url)
+    valid_url = lambda u: 'kaufland.de' in u and ('/product/' in u or '/item/' in u or '/pdp/' in u)
+    products = execute_ddg_search(session, f"kaufland.de {keyword}", valid_url)
+    if len(products) < 20:
+        products.extend(execute_ddg_search(session, f"site:kaufland.de {keyword}", valid_url))
+    if len(products) < 20:
+        products.extend(execute_bing_search(session, f"kaufland.de {keyword}", valid_url))
     if len(products) < 20:
         products.extend(execute_bing_search(session, f"site:kaufland.de {keyword}", valid_url))
    
@@ -257,11 +270,16 @@ def scrape_kaufland(session, keyword):
     return enrich_products_parallel(session, deduplicate(filtered)[:30], 'kaufland')
 
 
+# ---> ANGEPASST: Otto (Breitere Suche + Python-Filter für Produktlinks)
 def scrape_otto(session, keyword):
-    valid_url = lambda u: 'otto.de' in u and ('/p/' in u or '#variationid=' in u)
-    products = execute_ddg_search(session, f"site:otto.de/p {keyword}", valid_url)
+    valid_url = lambda u: 'otto.de' in u and ('/p/' in u or '#variationid=' in u or '/pdp/' in u)
+    products = execute_ddg_search(session, f"otto.de {keyword}", valid_url)
     if len(products) < 20:
-        products.extend(execute_bing_search(session, f"site:otto.de/p {keyword}", valid_url))
+        products.extend(execute_ddg_search(session, f"site:otto.de {keyword}", valid_url))
+    if len(products) < 20:
+        products.extend(execute_bing_search(session, f"otto.de {keyword}", valid_url))
+    if len(products) < 20:
+        products.extend(execute_bing_search(session, f"site:otto.de {keyword}", valid_url))
     return enrich_products_parallel(session, deduplicate(products)[:30], 'otto')
 
 
@@ -282,7 +300,7 @@ def scrape_generic(session, shop_key, domain, keyword):
 
 
 # ===================================================================
-# ROUTING
+# ROUTING (UNANGETASTET)
 # ===================================================================
 SHOP_DOMAINS = {
     'amazon': 'amazon.de', 'norma': 'norma24.de', 'netto': 'netto-online.de',
