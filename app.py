@@ -283,3 +283,8 @@ function fetchShopData(shopKey, keyword) {
   var json = JSON.parse(response.getContentText());
   return json;
 }
+
+if __name __ == '__main__':
+import os
+port = int(os.environ.get("PORT, 10000))
+app.run(host='0.0.0.0', port=port)
