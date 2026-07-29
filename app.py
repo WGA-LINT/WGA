@@ -136,7 +136,7 @@ def extract_product_tiles(html, domain, url_validator):
        
     return products
 
-# Fallback-Suchmaschine mit reinen Domain-Suchen
+# Multi-Suchmaschinen Fallback (DuckDuckGo + Yahoo + Bing)
 def execute_external_search(session, domain, keyword, valid_url_func):
     products, seen = [], set()
     q = f"site:{domain} {keyword}"
@@ -161,30 +161,28 @@ def execute_external_search(session, domain, keyword, valid_url_func):
                         seen.add(href)
     except Exception: pass
 
-    if len(products) >= MAX_RESULTS: return products[:MAX_RESULTS]
-
-    # 2. Yahoo Search
-    try:
-        res = session.get(f"https://search.yahoo.com/search?p={urllib.parse.quote(q)}", timeout=8)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.content, 'html.parser')
-            for a in soup.find_all('a', href=True):
-                link = a['href']
-                if 'RU=' in link:
-                    try: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
-                    except: pass
-                link = link.split('?')[0].split('#')[0]
-                if valid_url_func(link) and link not in seen:
-                    title = a.get_text(strip=True)
-                    title = re.sub(r'\s*[:|-|•]\s*.*$', '', title).strip()
-                    if len(title) > 4:
-                        products.append({"title": title, "price": "-", "imageUrl": "", "link": link})
-                        seen.add(link)
-    except Exception: pass
+    # 2. Yahoo DE Search
+    if len(products) < 10:
+        try:
+            res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote(q)}", timeout=8)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.content, 'html.parser')
+                for a in soup.find_all('a', href=True):
+                    link = a['href']
+                    if 'RU=' in link:
+                        try: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
+                        except: pass
+                    link = link.split('?')[0].split('#')[0]
+                    if valid_url_func(link) and link not in seen:
+                        title = a.get_text(strip=True)
+                        title = re.sub(r'\s*[:|-|•]\s*.*$', '', title).strip()
+                        if len(title) > 4:
+                            products.append({"title": title, "price": "-", "imageUrl": "", "link": link})
+                            seen.add(link)
+        except Exception: pass
 
     return products[:MAX_RESULTS]
 
-# Generic Enricher für unvollständige Kacheln
 def enrich_single_product(p, session, shop_key):
     if p.get('imageUrl') and p.get('price') != '-': return p
     try:
@@ -193,7 +191,7 @@ def enrich_single_product(p, session, shop_key):
             html = res.content.decode('utf-8', 'ignore')
             soup = BeautifulSoup(html, 'html.parser')
 
-            # JSON-LD Parser
+            # 1. JSON-LD Parser
             for script in soup.find_all('script', type='application/ld+json'):
                 try:
                     data = json.loads(script.string or '')
@@ -215,27 +213,16 @@ def enrich_single_product(p, session, shop_key):
                                     if pr: p['price'] = format_price_string(str(pr))
                 except Exception: pass
 
-            # Shop-spezifische Fallbacks
-            if shop_key == 'otto':
-                if not p.get('imageUrl') or not is_valid_image(p.get('imageUrl')):
-                    m_otto_img = re.search(r'["\'](https://i\.otto\.de/i/otto/[^"\']+)["\']', html)
-                    if m_otto_img: p['imageUrl'] = m_otto_img.group(1)
+            # 2. Norma & Netto Fallbacks
+            if shop_key in ['norma', 'netto']:
                 if p.get('price') == '-':
-                    m_otto_pr = re.search(r'data-qa=["\']price["\'][^>]*>([^<]+)', html) or re.search(r'["\']price["\']\s*:\s*["\']?(\d+[\.,]\d{2})["\']?', html) or re.search(r'(\d+[\.,]\d{2})\s*€', html)
-                    if m_otto_pr: p['price'] = format_price_string(m_otto_pr.group(1))
-
-            if shop_key == 'smythtoys':
+                    m_pr = re.search(r'itemprop=["\']price["\'][^>]*content=["\']([\d\.]+)["\']', html) or re.search(r'(\d+[\.,]\d{2})\s*€', html)
+                    if m_pr: p['price'] = format_price_string(m_pr.group(1))
                 if not p.get('imageUrl') or not is_valid_image(p.get('imageUrl')):
-                    m_smyth_img = re.search(r'["\'](https://image\.smythstoys\.com/[^"\']+)["\']', html)
-                    if m_smyth_img: p['imageUrl'] = m_smyth_img.group(1)
-                if p.get('price') == '-':
-                    m_smyth_pr = re.search(r'itemprop=["\']price["\'][^>]*content=["\']([\d\.]+)["\']', html) or re.search(r'class=["\']price_main["\'][^>]*>([^<]+)', html) or re.search(r'(\d+[\.,]\d{2})\s*€', html)
-                    if m_smyth_pr: p['price'] = format_price_string(m_smyth_pr.group(1))
+                    m_img = re.search(r'["\'](https://[^"\']*\.(?:jpg|png|webp|jpeg))["\']', html, re.I)
+                    if m_img and is_valid_image(m_img.group(1)): p['imageUrl'] = m_img.group(1)
 
-            if shop_key == 'obi' and (not p.get('imageUrl') or not is_valid_image(p.get('imageUrl'))):
-                m_obi = re.search(r'["\'](https://(?:media|assets)\.obi\.de/[^"\']*?(?:jpg|png|webp|jpeg))["\']', html, re.I)
-                if m_obi and is_valid_image(m_obi.group(1)): p['imageUrl'] = m_obi.group(1).replace('\\u002F', '/')
-
+            # 3. Allg. Meta-Tags
             if not p.get('imageUrl') or not is_valid_image(p.get('imageUrl')):
                 img = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
                 if img and img.get('content') and is_valid_image(img['content']):
@@ -261,14 +248,20 @@ def enrich_products_parallel(session, products, shop_key):
     cleaned = []
     for p in products:
         if not is_valid_image(p.get('imageUrl')): p['imageUrl'] = ""
-        if shop_key in ['jysk', 'smythtoys'] and p['price'] == '-' and not p['imageUrl']: continue
+       
+        # JYSK Müll-Filter: Löscht Kategorieneinträge, Garantie-Überschriften und artikellose Zeilen
+        if shop_key == 'jysk':
+            title_l = p.get('title', '').lower()
+            if p['price'] == '-' or any(bad in title_l for bad in ['garantie', 'überkategorie', 'kategorie', 'service', 'über uns']):
+                continue
+               
         cleaned.append(p)
 
     return cleaned
 
 
 # ===================================================================
-# ISOLIERTE ROUTINEN FÜR ALLE ERFOLGS-SHOPS (UNANTASTBAR)
+# ISOLIERTE ROUTINEN (VOLLKOMMEN GESCHÜTZT)
 # ===================================================================
 
 # 1. AMAZON (ISOLIERT)
@@ -300,11 +293,13 @@ def scrape_amazon(keyword):
         except Exception: pass
     return deduplicate(products)[:MAX_RESULTS]
 
-# 2. NORMA (ISOLIERT)
+# 2. NORMA (ISOLIERT & REPARIERT)
 def scrape_norma(keyword):
     session = get_session()
     domain = 'norma24.de'
-    def v(u): return domain in u.lower() and not any(b in u.lower() for b in ['/impressum', '/datenschutz', '/agb', '/login', '/cart', '/konto'])
+    def v(u):
+        l = u.lower()
+        return domain in l and not any(b in l for b in ['/impressum', '/datenschutz', '/agb', '/login', '/cart', '/konto', '/service'])
     products = []
     try:
         res = session.get(f"https://www.norma24.de/suche?q={urllib.parse.quote(keyword)}", timeout=8)
@@ -313,15 +308,13 @@ def scrape_norma(keyword):
     if len(products) < 10: products.extend(execute_external_search(session, domain, keyword, v))
     return enrich_products_parallel(session, deduplicate(products)[:MAX_RESULTS], 'norma')
 
-# 3. NETTO (ISOLIERT MIT RESTORED-LOGIK)
+# 3. NETTO (ISOLIERT & REPARIERT)
 def scrape_netto(keyword):
     session = get_session()
     domain = 'netto-online.de'
     def v(u):
         l = u.lower()
-        if domain not in l: return False
-        if any(b in l for b in ['/impressum', '/datenschutz', '/agb', '/login', '/cart', '/konto', '/service']): return False
-        return any(p in l for p in ['/p/', '/artikel/', '/p-']) or len(l.split('/')) > 4
+        return domain in l and not any(b in l for b in ['/impressum', '/datenschutz', '/agb', '/login', '/cart', '/konto', '/service'])
     products = []
     try:
         res = session.get(f"https://www.netto-online.de/s/?query={urllib.parse.quote(keyword)}", timeout=8)
@@ -384,7 +377,7 @@ def scrape_bauhaus(keyword):
 
 
 # ===================================================================
-# GENERIC ROUTINE (Nur noch für die restlichen SPA-Problemfälle)
+# GENERIC ROUTINE (Für verbleibende SPA-Shops)
 # ===================================================================
 def scrape_generic(session, shop_key, domain, keyword):
     search_urls = {
@@ -404,11 +397,7 @@ def scrape_generic(session, shop_key, domain, keyword):
         if any(b in l for b in ['/impressum', '/datenschutz', '/agb', '/login', '/cart', '/konto', '/service', '/help', '/blog/', '/search', '/suche', '/kategorie']):
             return False
            
-        # Spezifische Pfadfilter
-        if shop_key == 'smythtoys':
-            if '/c/' in l: return False # Blockiert Kategorieseiten
-            if not any(p in l for p in ['/p/', '/product/']) and not re.search(r'\d{5,}', l): return False
-
+        if shop_key == 'smythtoys' and '/c/' in l: return False
         if shop_key == 'jysk' and len([p for p in urllib.parse.urlparse(l).path.split('/') if p]) < 2: return False
         if shop_key == 'ikea' and not any(p in l for p in ['/p/', '/pe', '/art/', '/products/']): return False
         if shop_key == 'hm' and 'productpage' not in l and '/product/' not in l: return False
@@ -458,7 +447,7 @@ def scrape():
     if not keyword or not shop_key or shop_key not in SHOP_DOMAINS:
         return jsonify({"error": "Ungültige Parameter"}), 400
 
-    # Aufruf der vollkommen isolierten Routinen
+    # Aufruf der isolierten Erfolgs-Funktionen
     if shop_key == 'amazon': products = scrape_amazon(keyword)
     elif shop_key == 'norma': products = scrape_norma(keyword)
     elif shop_key == 'netto': products = scrape_netto(keyword)
