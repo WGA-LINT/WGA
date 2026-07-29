@@ -1,6 +1,7 @@
 import os
 import re
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 from bs4 import BeautifulSoup
 
@@ -15,7 +16,7 @@ app = Flask(__name__)
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
     'Accept-Encoding': 'gzip, deflate, br',
     'Sec-Ch-Ua': '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
@@ -60,10 +61,12 @@ def get_session():
     else:
         session = crequests.Session()
     session.headers.update(HEADERS)
+    # Zwingt Amazon auf EUR und Deutsch (hebelt US-IP Währungsumrechnung aus)
+    session.cookies.set("i18n-prefs", "EUR", domain=".amazon.de")
+    session.cookies.set("lc-main", "de_DE", domain=".amazon.de")
     return session
 
 def get_amazon_image_url(asin):
-    # Zuverlässige Amazon-Bild-API (funktioniert für jede ASIN in Google Sheets)
     return f"https://ws-eu.amazon-adsystem.com/widgets/q?_encoding=UTF-8&ASIN={asin}&Format=_SL300_&ID=AsinImage&MarketPlace=DE&ServiceVersion=20070822&WS=1"
 
 @app.route('/')
@@ -96,7 +99,7 @@ def scrape():
         except Exception as e:
             print(f"Direct Amazon Error: {e}")
 
-    # Strategie 2: DuckDuckGo Fallback (erweitert für bis zu 30 Produkte)
+    # Strategie 2: DuckDuckGo Fallback
     if len(products) < 25:
         try:
             ddg_prods = search_ddg_html(session, target_domain, keyword, shop_key)
@@ -114,7 +117,8 @@ def scrape():
         except Exception as e:
             print(f"Bing Error: {e}")
 
-    products = enrich_products(products, shop_key)
+    # Universelles Anreichern von Bildern & Euro-Preisen für ALLE Shops (Norma, OBI, OTTO etc.)
+    products = enrich_products_parallel(session, products[:30], shop_key)
 
     return jsonify({
         "status": "success",
@@ -129,13 +133,11 @@ def scrape():
 def scrape_amazon_direct(session, keyword):
     products = []
    
-    # 1. Warmup Session
     try:
         session.get("https://www.amazon.de", timeout=5)
     except Exception:
         pass
 
-    # 2. Realistische Amazon Such-URL
     url = f"https://www.amazon.de/s?k={urllib.parse.quote(keyword)}&ref=nb_sb_noss"
     res = session.get(url, timeout=10)
    
@@ -143,7 +145,6 @@ def scrape_amazon_direct(session, keyword):
         print("Amazon direct blocked or CAPTCHA triggered.")
         return products
 
-    # UTF-8 Dekodierung erzwingen
     html_content = res.content.decode('utf-8', 'ignore')
     soup = BeautifulSoup(html_content, 'html.parser')
     items = soup.find_all('div', {'data-component-type': 's-search-result'})
@@ -165,14 +166,12 @@ def scrape_amazon_direct(session, keyword):
             continue
 
         link = f"https://www.amazon.de/dp/{asin}"
-       
-        img_tag = item.select_one('img.s-image')
-        img_url = img_tag['src'] if img_tag and img_tag.has_attr('src') else get_amazon_image_url(asin)
+        img_url = get_amazon_image_url(asin)
 
         price = "-"
         price_tag = item.select_one('.a-price .a-offscreen')
         if price_tag:
-            price = price_tag.get_text().strip()
+            price = format_price_string(price_tag.get_text())
         else:
             p_w = item.select_one('.a-price-whole')
             p_f = item.select_one('.a-price-fraction')
@@ -275,6 +274,83 @@ def search_bing(session, domain, keyword, shop_key):
     return products
 
 
+def fetch_metadata_for_product(session, product):
+    # Liest Bild und Preis direkt aus den OpenGraph/Schema.org Meta-Tags der Produktseite aus
+    if product.get('imageUrl') and product.get('price') != '-':
+        return product
+
+    try:
+        res = session.get(product['link'], timeout=4)
+        if res.status_code == 200:
+            html = res.content.decode('utf-8', 'ignore')
+            soup = BeautifulSoup(html, 'html.parser')
+
+            # 1. Bild extrahieren (og:image / twitter:image)
+            if not product.get('imageUrl'):
+                og_img = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
+                if og_img and og_img.get('content'):
+                    img_url = og_img['content']
+                    if img_url.startswith('//'):
+                        img_url = 'https:' + img_url
+                    elif img_url.startswith('/'):
+                        parsed_link = urllib.parse.urlparse(product['link'])
+                        img_url = f"{parsed_link.scheme}://{parsed_link.netloc}{img_url}"
+                    product['imageUrl'] = img_url
+
+            # 2. Preis extrahieren (product:price:amount / JSON-LD)
+            if product.get('price') == '-':
+                og_price = soup.find('meta', property='product:price:amount') or soup.find('meta', property='og:price:amount')
+                if og_price and og_price.get('content'):
+                    product['price'] = format_price_string(og_price['content'])
+                else:
+                    scripts = soup.find_all('script', type='application/ld+json')
+                    for s in scripts:
+                        if s.string and '"price"' in s.string:
+                            m = re.search(r'"price"\s*:\s*["\']?([\d.,]+)["\']?', s.string)
+                            if m:
+                                product['price'] = format_price_string(m.group(1))
+                                break
+    except Exception:
+        pass
+    return product
+
+
+def enrich_products_parallel(session, products, shop_key):
+    # Amazon-spezifisches Bild erzwingen
+    for p in products:
+        if shop_key == 'amazon' or 'amazon.de' in p['link']:
+            asin_match = re.search(r'(?:dp/|gp/product/|/)([A-Z0-9]{10})(?:[\?/]|$)', p['link'], re.IGNORECASE)
+            if asin_match:
+                asin = asin_match.group(1).upper()
+                p['link'] = f"https://www.amazon.de/dp/{asin}"
+                p['imageUrl'] = get_amazon_image_url(asin)
+
+    # Paralleler Abruf der Meta-Daten für fehlende Bilder & Preise (Norma, Otto, Netto etc.)
+    items_to_fetch = [p for p in products if not p.get('imageUrl') or p.get('price') == '-']
+    if items_to_fetch:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(fetch_metadata_for_product, session, p) for p in items_to_fetch]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    pass
+
+    return products
+
+
+def format_price_string(text):
+    if not text:
+        return "-"
+    # Wandelt US-Dollar Zeichen oder Punkte sauber in Euro-Format um
+    text = text.replace('$', '').replace('USD', '').replace('EUR', '').strip()
+    match = re.search(r'(\d{1,4}[.,]\d{2})', text)
+    if match:
+        val = match.group(1).replace('.', ',')
+        return f"{val} €"
+    return "-"
+
+
 def is_junk_title(title):
     t = title.strip().lower()
     if len(t) < 8:
@@ -312,7 +388,7 @@ def extract_price(text):
     match = re.search(r'(\d{1,4}[.,]\d{2})\s*€', text) or re.search(r'€\s*(\d{1,4}[.,]\d{2})', text)
     if match:
         val = match.group(1).replace('.', ',')
-        return val if '€' in val else f"{val} €"
+        return f"{val} €"
     return "-"
 
 
@@ -325,18 +401,6 @@ def deduplicate(products):
             seen.add(link_clean)
             unique.append(p)
     return unique
-
-
-def enrich_products(products, shop_key):
-    for p in products:
-        if shop_key == 'amazon' or 'amazon.de' in p['link']:
-            asin_match = re.search(r'(?:dp/|gp/product/|/)([A-Z0-9]{10})(?:[\?/]|$)', p['link'], re.IGNORECASE)
-            if asin_match:
-                asin = asin_match.group(1).upper()
-                p['link'] = f"https://www.amazon.de/dp/{asin}"
-                if not p['imageUrl'] or 'images-na' in p['imageUrl']:
-                    p['imageUrl'] = get_amazon_image_url(asin)
-    return products
 
 
 if __name__ == '__main__':
