@@ -3,20 +3,19 @@ from bs4 import BeautifulSoup
 import re
 import urllib.parse
 
-# curl_cffi imitiert echte Browser-TLS-Signaturen
 try:
     from curl_cffi import requests as crequests
-    USE_CURL_CFFI = True
+    USE_CURL = True
 except ImportError:
     import requests as crequests
-    USE_CURL_CFFI = False
+    USE_CURL = False
 
 app = Flask(__name__)
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Accept-Language': 'de-DE,de;q=0.9,en-US;q=0.8',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
 }
 
 SHOP_DOMAINS = {
@@ -35,10 +34,9 @@ SHOP_DOMAINS = {
     'bauhaus': 'bauhaus.info'
 }
 
-def make_request(url, method="GET", data=None):
-    """Führt HTTP-Requests mit Chrome-TLS-Impersonation aus"""
+def fetch_html(url, method="GET", data=None):
     try:
-        if USE_CURL_CFFI:
+        if USE_CURL:
             if method == "POST":
                 return crequests.post(url, data=data, headers=HEADERS, impersonate="chrome120", timeout=12)
             return crequests.get(url, headers=HEADERS, impersonate="chrome120", timeout=12)
@@ -47,15 +45,33 @@ def make_request(url, method="GET", data=None):
                 return crequests.post(url, data=data, headers=HEADERS, timeout=12)
             return crequests.get(url, headers=HEADERS, timeout=12)
     except Exception as e:
-        print(f"Request Error [{url}]: {e}")
+        print(f"Fetch Error ({url}): {e}")
         return None
 
 @app.route('/')
 def home():
+    return jsonify({"status": "online", "curl_cffi": USE_CURL})
+
+@app.route('/debug')
+def debug():
+    shop = request.args.get('shop', 'amazon')
+    keyword = request.args.get('keyword', 'katzenspielzeug')
+   
+    # Test DDG Lite
+    ddg_products = search_ddg_lite(SHOP_DOMAINS.get(shop, 'amazon.de'), keyword)
+   
+    # Test Direct Search
+    direct_products = []
+    if shop == 'amazon':
+        direct_products = direct_amazon_search(keyword)
+       
     return jsonify({
-        "status": "active",
-        "engine": "curl_cffi TLS Impersonator",
-        "supported_shops": list(SHOP_DOMAINS.keys())
+        "shop": shop,
+        "keyword": keyword,
+        "ddg_lite_count": len(ddg_products),
+        "direct_count": len(direct_products),
+        "sample_ddg": ddg_products[:2],
+        "sample_direct": direct_products[:2]
     })
 
 @app.route('/scrape', methods=['GET'])
@@ -70,169 +86,147 @@ def scrape():
         return jsonify({"error": f"Unbekannter Shop '{shop_key}'."}), 400
 
     target_domain = SHOP_DOMAINS[shop_key]
-   
-    try:
-        products = []
-       
-        # 1. DuckDuckGo HTML Index
-        products = search_duckduckgo(target_domain, keyword)
-       
-        # 2. Yahoo Search Fallback
-        if len(products) < 5:
-            yahoo_prods = search_yahoo(target_domain, keyword)
-            products.extend(yahoo_prods)
-            products = remove_duplicates(products)
-           
-        # 3. Bing Search Fallback
-        if len(products) < 5:
-            bing_prods = search_bing(target_domain, keyword)
-            products.extend(bing_prods)
-            products = remove_duplicates(products)
+    products = []
 
-        # Nachbearbeitung von Amazon-Bildern
-        if shop_key == 'amazon':
-            for p in products:
-                asin_match = re.search(r'(?:dp/|gp/product/|/)([A-Z0-9]{10})(?:[\?/]|$)', p['link'])
-                if asin_match:
-                    asin = asin_match.group(1)
-                    p['link'] = f"https://www.amazon.de/dp/{asin}"
+    # Strategie 1: Direkt-Suche (falls Amazon)
+    if shop_key == 'amazon':
+        products = direct_amazon_search(keyword)
+
+    # Strategie 2: DuckDuckGo Lite Search (Cloud-IP-resistent)
+    if len(products) < 5:
+        ddg_prods = search_ddg_lite(target_domain, keyword)
+        products.extend(ddg_prods)
+        products = remove_duplicates(products)
+
+    # Nachbearbeitung Amazon-Bilder
+    if shop_key == 'amazon':
+        for p in products:
+            asin_match = re.search(r'(?:dp/|gp/product/|/)([A-Z0-9]{10})(?:[\?/]|$)', p['link'])
+            if asin_match:
+                asin = asin_match.group(1)
+                p['link'] = f"https://www.amazon.de/dp/{asin}"
+                if not p['imageUrl'] or 'amazon' not in p['imageUrl']:
                     p['imageUrl'] = f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX300_.jpg"
 
-        return jsonify({
-            "status": "success",
-            "shop": shop_key,
-            "domain": target_domain,
-            "keyword": keyword,
-            "count": len(products),
-            "products": products
+    return jsonify({
+        "status": "success",
+        "shop": shop_key,
+        "domain": target_domain,
+        "keyword": keyword,
+        "count": len(products),
+        "products": products
+    })
+
+
+def direct_amazon_search(keyword):
+    """Direkte Suche auf Amazon.de mit TLS-Impersonation"""
+    products = []
+    url = f"https://www.amazon.de/s?k={urllib.parse.quote(keyword)}"
+    res = fetch_html(url)
+   
+    if not res or res.status_code != 200:
+        return products
+
+    soup = BeautifulSoup(res.text, 'html.parser')
+    items = soup.select('div[data-component-type="s-search-result"]')
+
+    for item in items:
+        try:
+            title_tag = item.select_one('h2 a span')
+            link_tag = item.select_one('h2 a')
+            price_whole = item.select_one('.a-price-whole')
+            price_fraction = item.select_one('.a-price-fraction')
+            img_tag = item.select_one('img.s-image')
+
+            if not title_tag or not link_tag:
+                continue
+
+            title = title_tag.get_text().strip()
+            raw_link = link_tag.get('href', '')
+           
+            asin = item.get('data-asin', '')
+            if asin:
+                link = f"https://www.amazon.de/dp/{asin}"
+                img_url = f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX300_.jpg"
+            else:
+                link = "https://www.amazon.de" + raw_link.split('?')[0]
+                img_url = img_tag.get('src', '') if img_tag else ""
+
+            price = "-"
+            if price_whole:
+                p_w = price_whole.get_text().replace('.', '').strip()
+                p_f = price_fraction.get_text().strip() if price_fraction else "00"
+                price = f"{p_w},{p_f} €"
+
+            products.append({
+                "title": title,
+                "price": price,
+                "imageUrl": img_url,
+                "link": link
+            })
+            if len(products) >= 30:
+                break
+        except Exception:
+            continue
+
+    return products
+
+
+def search_ddg_lite(domain, keyword):
+    """DuckDuckGo Lite (Sehr verlässlich gegen Datacenter-Blocks)"""
+    products = []
+    seen = set()
+    url = "https://lite.duckduckgo.com/lite/"
+    data = {'q': f'site:{domain} {keyword}'}
+
+    res = fetch_html(url, method="POST", data=data)
+    if not res or res.status_code != 200:
+        return products
+
+    soup = BeautifulSoup(res.text, 'html.parser')
+    rows = soup.find_all('tr')
+
+    for i in range(len(rows)):
+        a = rows[i].find('a', class_='result-link')
+        if not a:
+            continue
+
+        raw_href = a.get('href', '')
+        if 'uddg=' in raw_href:
+            link = urllib.parse.unquote(raw_href.split('uddg=')[1].split('&')[0])
+        else:
+            link = raw_href
+
+        if not is_valid_product_url(link, domain):
+            continue
+
+        clean_link = link.split('?')[0]
+        if clean_link in seen:
+            continue
+
+        title = clean_product_title(a.get_text(), domain)
+        if not title or len(title) < 3:
+            continue
+
+        seen.add(clean_link)
+
+        # Preis aus dem Textauszug (Snippet) der Folgezeile auslesen
+        price = "-"
+        if i + 1 < len(rows):
+            snippet_td = rows[i + 1].find('td', class_='result-snippet')
+            if snippet_td:
+                price = extract_price_from_text(snippet_td.get_text())
+
+        products.append({
+            "title": title,
+            "price": price,
+            "imageUrl": "",
+            "link": clean_link
         })
 
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        if len(products) >= 30:
+            break
 
-
-def search_duckduckgo(domain, keyword):
-    products = []
-    seen = set()
-    url = "https://html.duckduckgo.com/html/"
-    data = {'q': f'site:{domain} {keyword}'}
-   
-    res = make_request(url, method="POST", data=data)
-    if res and res.status_code == 200:
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for a in soup.find_all('a', class_='result__a'):
-            raw_href = a.get('href', '')
-            link = urllib.parse.unquote(raw_href.split('uddg=')[1].split('&')[0]) if 'uddg=' in raw_href else raw_href
-           
-            if not is_valid_product_url(link, domain):
-                continue
-               
-            clean_link = link.split('?')[0]
-            if clean_link in seen:
-                continue
-               
-            title = clean_product_title(a.get_text(), domain)
-            if not title or len(title) < 3:
-                continue
-               
-            seen.add(clean_link)
-           
-            price = "-"
-            parent = a.find_parent('div', class_='result__body')
-            if parent:
-                snippet = parent.find('a', class_='result__snippet')
-                if snippet:
-                    price = extract_price_from_text(snippet.get_text())
-                   
-            img_url = extract_image_from_soup(parent)
-
-            products.append({
-                "title": title,
-                "price": price,
-                "imageUrl": img_url,
-                "link": clean_link
-            })
-            if len(products) >= 30:
-                break
-    return products
-
-
-def search_yahoo(domain, keyword):
-    products = []
-    seen = set()
-    url = f"https://search.yahoo.com/search?p=site:{domain}+{urllib.parse.quote(keyword)}"
-   
-    res = make_request(url)
-    if res and res.status_code == 200:
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for div in soup.find_all('div', class_='compTitle'):
-            a = div.find('a', href=True)
-            if not a:
-                continue
-            link = a['href']
-            if not is_valid_product_url(link, domain):
-                continue
-               
-            clean_link = link.split('?')[0]
-            if clean_link in seen:
-                continue
-               
-            title = clean_product_title(a.get_text(), domain)
-            if not title or len(title) < 3:
-                continue
-               
-            seen.add(clean_link)
-            parent = div.find_parent('div', class_='dd')
-            price = extract_price_from_text(parent.get_text()) if parent else "-"
-            img_url = extract_image_from_soup(parent)
-
-            products.append({
-                "title": title,
-                "price": price,
-                "imageUrl": img_url,
-                "link": clean_link
-            })
-            if len(products) >= 30:
-                break
-    return products
-
-
-def search_bing(domain, keyword):
-    products = []
-    seen = set()
-    url = f"https://www.bing.com/search?q=site:{domain}+{urllib.parse.quote(keyword)}"
-   
-    res = make_request(url)
-    if res and res.status_code == 200:
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for item in soup.find_all('li', class_='b_algo'):
-            a = item.find('a', href=True)
-            if not a:
-                continue
-            link = a['href']
-            if not is_valid_product_url(link, domain):
-                continue
-               
-            clean_link = link.split('?')[0]
-            if clean_link in seen:
-                continue
-               
-            title = clean_product_title(a.get_text(), domain)
-            if not title or len(title) < 3:
-                continue
-               
-            seen.add(clean_link)
-            price = extract_price_from_text(item.get_text())
-            img_url = extract_image_from_soup(item)
-
-            products.append({
-                "title": title,
-                "price": price,
-                "imageUrl": img_url,
-                "link": clean_link
-            })
-            if len(products) >= 30:
-                break
     return products
 
 
@@ -240,15 +234,12 @@ def is_valid_product_url(url, domain):
     u = url.lower()
     if domain not in u:
         return False
-   
-    bad = ['/impressum', '/datenschutz', '/agb', '/service', '/filialen', '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/presse', '/kontakt']
+    bad = ['/impressum', '/datenschutz', '/agb', '/service', '/filialen', '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/kontakt']
     for b in bad:
         if b in u:
             return False
-           
-    if 'amazon.de' in domain and not ('/dp/' in u or '/gp/product/' in u or '/asin/' in u):
+    if 'amazon.de' in domain and not ('/dp/' in u or '/gp/product/' in u):
         return False
-       
     return True
 
 
@@ -257,7 +248,6 @@ def clean_product_title(title, domain):
         return ""
     clean = re.sub(r'\s*[:|-|•]\s*.*$', '', title)
     clean = re.sub(r'online kaufen.*$', '', clean, flags=re.IGNORECASE)
-    clean = re.sub(r'auf OTTO\.de.*$', '', clean, flags=re.IGNORECASE)
     clean = re.sub(r'bei Amazon.*$', '', clean, flags=re.IGNORECASE)
     return clean.strip()
 
@@ -270,14 +260,6 @@ def extract_price_from_text(text):
         val = match.group(1).replace('.', ',')
         return val if '€' in val else f"{val} €"
     return "-"
-
-
-def extract_image_from_soup(soup_item):
-    if soup_item:
-        img_tag = soup_item.find('img')
-        if img_tag and img_tag.get('src') and 'http' in img_tag['src']:
-            return img_tag['src']
-    return ""
 
 
 def remove_duplicates(products):
