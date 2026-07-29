@@ -66,7 +66,6 @@ def get_session():
     return session
 
 def get_amazon_image_url(asin):
-    # Google Sheets blockiert AdSystem-Redirects. Daher direkter Abruf vom Media Server.
     return f"https://images-eu.ssl-images-amazon.com/images/P/{asin}.03._SCLZZZZZZZ_SX500_.jpg"
 
 @app.route('/')
@@ -114,7 +113,6 @@ def scrape():
         except Exception as e:
             pass
 
-    # Bilder und Preise reparieren/nachladen
     products = enrich_products_parallel(products[:30], shop_key)
 
     return jsonify({
@@ -160,27 +158,32 @@ def scrape_amazon_direct(session, keyword):
             continue
 
         link = f"https://www.amazon.de/dp/{asin}"
-       
-        # Sichern des originalen, echten Amazon-Bildes
         img_tag = item.select_one('img.s-image')
         img_url = img_tag['src'] if img_tag and img_tag.has_attr('src') else get_amazon_image_url(asin)
 
-        # Verbesserte Preissuche für Prime / Sparabo Sonderfälle
         price = "-"
-        price_tag = item.select_one('.a-price .a-offscreen')
-        if price_tag:
-            price = format_price_string(price_tag.get_text())
-        else:
+        price_candidates = [
+            '.a-price .a-offscreen',
+            'span.a-price',
+            '.a-color-price',
+            '.a-text-price .a-offscreen',
+            'span.a-size-base.a-color-price'
+        ]
+        for selector in price_candidates:
+            p_elem = item.select_one(selector)
+            if p_elem:
+                formatted = format_price_string(p_elem.get_text())
+                if formatted != "-":
+                    price = formatted
+                    break
+
+        if price == "-":
             p_w = item.select_one('.a-price-whole')
             p_f = item.select_one('.a-price-fraction')
             if p_w:
                 w_txt = p_w.get_text().replace('.', '').replace(',', '').strip()
                 f_txt = p_f.get_text().strip() if p_f else "00"
                 price = f"{w_txt},{f_txt} €"
-            else:
-                c_p = item.select_one('.a-color-price')
-                if c_p:
-                    price = format_price_string(c_p.get_text())
 
         products.append({
             "title": title,
@@ -191,95 +194,12 @@ def scrape_amazon_direct(session, keyword):
     return products
 
 
-def fetch_metadata_for_product(product):
-    # Abbruch, wenn bereits Bild und Preis vorhanden sind
-    if product.get('imageUrl') and product.get('price') != '-':
-        return product
-
-    try:
-        # GANZ WICHTIG: Frische Anfrage pro Thread! (Verhindert curl_cffi Crash)
-        if HAS_CURL:
-            res = crequests.get(product['link'], impersonate="chrome120", headers=HEADERS, timeout=8)
-        else:
-            res = crequests.get(product['link'], headers=HEADERS, timeout=8)
-
-        if res.status_code == 200:
-            html = res.content.decode('utf-8', 'ignore')
-            soup = BeautifulSoup(html, 'html.parser')
-
-            # 1. BILD EXTRAHIEREN (Mit Fallbacks für Shops wie Norma / Netto)
-            if not product.get('imageUrl'):
-                img_url = ""
-                og_img = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
-                if og_img and og_img.get('content'):
-                    img_url = og_img['content']
-                else:
-                    img_tag = soup.find('img', itemprop='image') or soup.find('img', class_=re.compile(r'product.*image', re.I))
-                    if img_tag and img_tag.get('src'):
-                        img_url = img_tag['src']
-               
-                if img_url:
-                    if img_url.startswith('//'):
-                        img_url = 'https:' + img_url
-                    elif img_url.startswith('/'):
-                        parsed = urllib.parse.urlparse(product['link'])
-                        img_url = f"{parsed.scheme}://{parsed.netloc}{img_url}"
-                    product['imageUrl'] = img_url
-
-            # 2. PREIS EXTRAHIEREN (Sucht in Meta-Tags und unsichtbaren Skripten)
-            if product.get('price') == '-':
-                og_price = soup.find('meta', property='product:price:amount') or soup.find('meta', property='og:price:amount')
-                if og_price and og_price.get('content'):
-                    product['price'] = format_price_string(og_price['content'])
-               
-                if product.get('price') == '-':
-                    itemprop_price = soup.find(attrs={"itemprop": "price"})
-                    if itemprop_price and itemprop_price.get("content"):
-                        product['price'] = format_price_string(itemprop_price["content"])
-
-                if product.get('price') == '-':
-                    for s in soup.find_all('script', type='application/ld+json'):
-                        if s.string and '"price"' in s.string:
-                            m = re.search(r'"price"\s*:\s*["\']?([\d.,]+)["\']?', s.string)
-                            if m:
-                                product['price'] = format_price_string(m.group(1))
-                                break
-    except Exception:
-        pass
-   
-    return product
-
-
-def enrich_products_parallel(products, shop_key):
-    # Amazon Links reparieren, ABER bereits existierende Bilder (von scrape_amazon_direct) nicht antasten!
-    for p in products:
-        if shop_key == 'amazon' or 'amazon.de' in p['link']:
-            asin_match = re.search(r'(?:dp/|gp/product/|/)([A-Z0-9]{10})(?:[\?/]|$)', p['link'], re.IGNORECASE)
-            if asin_match:
-                asin = asin_match.group(1).upper()
-                p['link'] = f"https://www.amazon.de/dp/{asin}"
-                if not p.get('imageUrl'):
-                    p['imageUrl'] = get_amazon_image_url(asin)
-
-    # Paralleler Abruf der Meta-Daten nur für Produkte, denen noch Infos fehlen
-    items_to_fetch = [p for p in products if not p.get('imageUrl') or p.get('price') == '-']
-    if items_to_fetch:
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(fetch_metadata_for_product, p) for p in items_to_fetch]
-            for future in futures:
-                try:
-                    future.result()
-                except Exception:
-                    pass
-
-    return products
-
-
 def search_ddg_html(session, domain, keyword, shop_key):
     products = []
+    # Flexiblerer Suchansatz (ohne Zwang zum site: Operator)
     queries = [
-        f"site:{domain}/dp/ {keyword}" if shop_key == 'amazon' else f"site:{domain} {keyword}",
-        f"site:{domain} {keyword} kaufen" if shop_key == 'amazon' else f"site:{domain} {keyword} produkt"
+        f"{domain} {keyword}",
+        f"site:{domain} {keyword}"
     ]
     for q in queries:
         url = "https://html.duckduckgo.com/html/"
@@ -296,7 +216,7 @@ def search_ddg_html(session, domain, keyword, shop_key):
                 parent = a.find_parent('div', class_='result__body')
                 title, desc = "", ""
                 if parent:
-                    t_elem = parent.select_one('a.result__snippet') or parent.select_one('h2')
+                    t_elem = parent.select_one('a.result__snippet') or parent.select_one('h2') or parent.select_one('.result__title')
                     if t_elem: title = clean_title(t_elem.get_text())
                     desc = parent.get_text()
                
@@ -312,27 +232,125 @@ def search_ddg_html(session, domain, keyword, shop_key):
         if len(products) >= 30: break
     return products
 
+
 def search_bing(session, domain, keyword, shop_key):
     products = []
-    query = f"site:{domain}/dp/ {keyword}" if shop_key == 'amazon' else f"site:{domain} {keyword}"
-    res = session.get(f"https://www.bing.com/search?q={urllib.parse.quote(query)}", timeout=10)
-    if res.status_code == 200:
-        soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
-        for item in soup.select('li.b_algo'):
-            a = item.find('a', href=True)
-            if not a: continue
-            link = a['href']
-            if not is_valid_url(link, domain): continue
-            title = clean_title(a.get_text())
-            if not title or is_junk_title(title): continue
-           
-            products.append({
-                "title": title,
-                "price": extract_price(item.get_text()),
-                "imageUrl": "",
-                "link": link.split('?')[0]
-            })
+    queries = [
+        f"{domain} {keyword}",
+        f"site:{domain} {keyword}"
+    ]
+    for query in queries:
+        res = session.get(f"https://www.bing.com/search?q={urllib.parse.quote(query)}", timeout=10)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
+            elements = soup.select('li.b_algo, div.b_algo')
+            for item in elements:
+                a = item.find('a', href=True)
+                if not a: continue
+                link = a['href']
+                if not is_valid_url(link, domain): continue
+                title = clean_title(a.get_text())
+                if not title or is_junk_title(title): continue
+               
+                products.append({
+                    "title": title,
+                    "price": extract_price(item.get_text()),
+                    "imageUrl": "",
+                    "link": link.split('?')[0]
+                })
+        if len(products) >= 30: break
     return products
+
+
+def fetch_metadata_for_product(product, shop_key):
+    if product.get('imageUrl') and product.get('price') != '-':
+        return product
+
+    try:
+        extra_headers = HEADERS.copy()
+        cookies = {"i18n-prefs": "EUR", "lc-main": "de_DE"} if shop_key == 'amazon' or 'amazon.de' in product['link'] else {}
+
+        if HAS_CURL:
+            res = crequests.get(product['link'], impersonate="chrome120", headers=extra_headers, cookies=cookies, timeout=8)
+        else:
+            res = crequests.get(product['link'], headers=extra_headers, cookies=cookies, timeout=8)
+
+        if res.status_code == 200:
+            html = res.content.decode('utf-8', 'ignore')
+            soup = BeautifulSoup(html, 'html.parser')
+
+            # 1. Bild extrahieren
+            if not product.get('imageUrl'):
+                img_url = ""
+                og_img = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
+                if og_img and og_img.get('content'):
+                    img_url = og_img['content']
+                else:
+                    img_tag = soup.find('img', itemprop='image') or soup.find('img', class_=re.compile(r'product.*image|p-image|main-image', re.I))
+                    if img_tag and img_tag.get('src'):
+                        img_url = img_tag['src']
+               
+                if img_url:
+                    if img_url.startswith('//'):
+                        img_url = 'https:' + img_url
+                    elif img_url.startswith('/'):
+                        parsed = urllib.parse.urlparse(product['link'])
+                        img_url = f"{parsed.scheme}://{parsed.netloc}{img_url}"
+                    product['imageUrl'] = img_url
+
+            # 2. Preis extrahieren
+            if product.get('price') == '-':
+                og_price = soup.find('meta', property='product:price:amount') or soup.find('meta', property='og:price:amount') or soup.find('meta', attrs={'name': 'twitter:data1'})
+                if og_price and og_price.get('content'):
+                    product['price'] = format_price_string(og_price['content'])
+
+                if product.get('price') == '-':
+                    itemprop_price = soup.find(attrs={"itemprop": "price"})
+                    if itemprop_price:
+                        val = itemprop_price.get("content") or itemprop_price.get_text()
+                        product['price'] = format_price_string(val)
+
+                if product.get('price') == '-':
+                    for s in soup.find_all('script', type='application/ld+json'):
+                        if s.string and '"price"' in s.string:
+                            m = re.search(r'"price"\s*:\s*["\']?([\d.,]+)["\']?', s.string)
+                            if m:
+                                product['price'] = format_price_string(m.group(1))
+                                break
+
+                if product.get('price') == '-':
+                    price_elem = soup.find(class_=re.compile(r'product-price|current-price|price--current|price-tag|price', re.I))
+                    if price_elem:
+                        product['price'] = format_price_string(price_elem.get_text())
+
+    except Exception:
+        pass
+   
+    return product
+
+
+def enrich_products_parallel(products, shop_key):
+    for p in products:
+        if shop_key == 'amazon' or 'amazon.de' in p['link']:
+            asin_match = re.search(r'(?:dp/|gp/product/|/)([A-Z0-9]{10})(?:[\?/]|$)', p['link'], re.IGNORECASE)
+            if asin_match:
+                asin = asin_match.group(1).upper()
+                p['link'] = f"https://www.amazon.de/dp/{asin}"
+                if not p.get('imageUrl'):
+                    p['imageUrl'] = get_amazon_image_url(asin)
+
+    items_to_fetch = [p for p in products if not p.get('imageUrl') or p.get('price') == '-']
+    if items_to_fetch:
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(fetch_metadata_for_product, p, shop_key) for p in items_to_fetch]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    pass
+
+    return products
+
 
 def format_price_string(text):
     if not text: return "-"
@@ -345,12 +363,14 @@ def format_price_string(text):
         return f"{match_int.group(1)},00 €"
     return "-"
 
+
 def is_junk_title(title):
     t = title.strip().lower()
     if len(t) < 8: return True
     for p in JUNK_TITLE_PATTERNS:
         if re.search(p, t): return True
     return False
+
 
 def is_valid_url(url, domain):
     u = url.lower()
@@ -361,17 +381,20 @@ def is_valid_url(url, domain):
         return False
     return True
 
+
 def clean_title(title):
     if not title: return ""
     clean = re.sub(r'\s*[:|-|•]\s*.*$', '', title)
     clean = re.sub(r'(online kaufen|jetzt bestellen|bei Amazon|auf OTTO\.de).*$', '', clean, flags=re.IGNORECASE)
     return clean.strip()
 
+
 def extract_price(text):
     if not text: return "-"
     match = re.search(r'(\d{1,4}[.,]\d{2})\s*€', text) or re.search(r'€\s*(\d{1,4}[.,]\d{2})', text)
     if match: return f"{match.group(1).replace('.', ',')} €"
     return "-"
+
 
 def deduplicate(products):
     seen, unique = set(), []
@@ -381,6 +404,7 @@ def deduplicate(products):
             seen.add(link_clean)
             unique.append(p)
     return unique
+
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
