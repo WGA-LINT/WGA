@@ -52,7 +52,14 @@ JUNK_TITLE_PATTERNS = [
     r'^präzises design',
     r'^produktbeschreibung',
     r'^kundenrezensionen',
-    r'^details'
+    r'^details',
+    r'online-shop',
+    r'riesenauswahl',
+    r'schnelle lieferung',
+    r'günstige preise',
+    r'jetzt.*produkte',
+    r'willkommen bei',
+    r'startseite'
 ]
 
 def get_session():
@@ -161,15 +168,18 @@ def scrape_amazon_direct(session, keyword):
         img_tag = item.select_one('img.s-image')
         img_url = img_tag['src'] if img_tag and img_tag.has_attr('src') else get_amazon_image_url(asin)
 
+        # Erweitertes Preis-Parsing für Amazon
         price = "-"
-        price_candidates = [
+        price_selectors = [
             '.a-price .a-offscreen',
             'span.a-price',
+            '#corePrice_feature_div .a-offscreen',
+            '#corePriceDisplay_desktop_feature_div .a-offscreen',
             '.a-color-price',
             '.a-text-price .a-offscreen',
             'span.a-size-base.a-color-price'
         ]
-        for selector in price_candidates:
+        for selector in price_selectors:
             p_elem = item.select_one(selector)
             if p_elem:
                 formatted = format_price_string(p_elem.get_text())
@@ -196,10 +206,11 @@ def scrape_amazon_direct(session, keyword):
 
 def search_ddg_html(session, domain, keyword, shop_key):
     products = []
-    # Flexiblerer Suchansatz (ohne Zwang zum site: Operator)
+    brand_name = domain.split('.')[0].replace('-online', '')
     queries = [
+        f"site:{domain} {keyword}",
         f"{domain} {keyword}",
-        f"site:{domain} {keyword}"
+        f"{brand_name} {keyword} kaufen"
     ]
     for q in queries:
         url = "https://html.duckduckgo.com/html/"
@@ -235,9 +246,11 @@ def search_ddg_html(session, domain, keyword, shop_key):
 
 def search_bing(session, domain, keyword, shop_key):
     products = []
+    brand_name = domain.split('.')[0].replace('-online', '')
     queries = [
+        f"site:{domain} {keyword}",
         f"{domain} {keyword}",
-        f"site:{domain} {keyword}"
+        f"{brand_name} {keyword} online"
     ]
     for query in queries:
         res = session.get(f"https://www.bing.com/search?q={urllib.parse.quote(query)}", timeout=10)
@@ -298,11 +311,30 @@ def fetch_metadata_for_product(product, shop_key):
                         img_url = f"{parsed.scheme}://{parsed.netloc}{img_url}"
                     product['imageUrl'] = img_url
 
-            # 2. Preis extrahieren
+            # 2. Preis extrahieren (inkl. Amazon-Spezialstrukturen auf der Produktdetailseite)
             if product.get('price') == '-':
-                og_price = soup.find('meta', property='product:price:amount') or soup.find('meta', property='og:price:amount') or soup.find('meta', attrs={'name': 'twitter:data1'})
-                if og_price and og_price.get('content'):
-                    product['price'] = format_price_string(og_price['content'])
+                if 'amazon.de' in product['link']:
+                    az_selectors = [
+                        '#corePrice_feature_div .a-offscreen',
+                        '#corePriceDisplay_desktop_feature_div .a-offscreen',
+                        '#priceblock_ourprice',
+                        '#priceblock_dealprice',
+                        '#priceblock_saleprice',
+                        'span.a-price span.a-offscreen',
+                        '.a-color-price'
+                    ]
+                    for sel in az_selectors:
+                        p_tag = soup.select_one(sel)
+                        if p_tag:
+                            formatted = format_price_string(p_tag.get_text())
+                            if formatted != "-":
+                                product['price'] = formatted
+                                break
+
+                if product.get('price') == '-':
+                    og_price = soup.find('meta', property='product:price:amount') or soup.find('meta', property='og:price:amount') or soup.find('meta', attrs={'name': 'twitter:data1'})
+                    if og_price and og_price.get('content'):
+                        product['price'] = format_price_string(og_price['content'])
 
                 if product.get('price') == '-':
                     itemprop_price = soup.find(attrs={"itemprop": "price"})
@@ -375,8 +407,16 @@ def is_junk_title(title):
 def is_valid_url(url, domain):
     u = url.lower()
     if domain not in u: return False
-    bad = ['/impressum', '/datenschutz', '/agb', '/service', '/filialen', '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/kontakt', '/b?']
+
+    # Haupt-Domain & reine Root-Pfade wie /de oder / filtern
+    parsed = urllib.parse.urlparse(u)
+    path = parsed.path.strip('/')
+    if not path or path in ['', 'de', 'de/', 'index.html', 'index.php', 'shop']:
+        return False
+
+    bad = ['/impressum', '/datenschutz', '/agb', '/service', '/filialen', '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/kontakt', '/b?', '/kategorie/']
     if any(b in u for b in bad): return False
+
     if 'amazon.de' in domain and not ('/dp/' in u or '/gp/product/' in u or re.search(r'/[a-z0-9]{10}', u)):
         return False
     return True
