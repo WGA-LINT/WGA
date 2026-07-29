@@ -30,13 +30,12 @@ HEADERS = {
 }
 
 # -------------------------------------------------------------------
-# INDIVIDUELLE SHOP-KONFIGURATION
-# Jeder Shop bekommt maßgeschneiderte Suchanfragen & strenge URL-Filter
+# SHOP-SPEZIFISCHE KONFIGURATION (Keine Pfade im site: Operator!)
 # -------------------------------------------------------------------
 SHOP_CONFIG = {
     'amazon': {
         'domain': 'amazon.de',
-        'queries': lambda kw: [f"amazon.de {kw}", f"site:amazon.de {kw}"],
+        'queries': lambda kw: [f"site:amazon.de {kw}", f"amazon.de {kw}"],
         'url_check': lambda u: bool(re.search(r'/(dp|gp/product)/[a-z0-9]{10}', u, re.I) or re.search(r'/[a-z0-9]{10}(?:[/?]|$)', u, re.I))
     },
     'norma': {
@@ -47,7 +46,7 @@ SHOP_CONFIG = {
     'netto': {
         'domain': 'netto-online.de',
         'queries': lambda kw: [f"site:netto-online.de {kw}", f"netto-online.de {kw}"],
-        'url_check': lambda u: bool(re.search(r'(/p-|/artikel/)', u)) # Garantiert Netto-Produkte
+        'url_check': lambda u: ('/p-' in u or '/p/' in u or '/artikel/' in u or u.endswith('.html')) and '/filialen' not in u and '/prospekt' not in u
     },
     'obi': {
         'domain': 'obi.de',
@@ -71,18 +70,18 @@ SHOP_CONFIG = {
     },
     'kaufland': {
         'domain': 'kaufland.de',
-        'queries': lambda kw: [f"site:kaufland.de/product {kw}", f"kaufland.de {kw}"],
-        'url_check': lambda u: '/product/' in u # Verhindert Kategorie-Landingpages
+        'queries': lambda kw: [f"site:kaufland.de {kw}", f"kaufland.de {kw}"],
+        'url_check': lambda u: '/product/' in u or '/item/' in u or '/pdp/' in u
     },
     'otto': {
         'domain': 'otto.de',
-        'queries': lambda kw: [f"site:otto.de/p {kw}", f"otto.de {kw}"],
-        'url_check': lambda u: '/p/' in u # Verhindert "Bis zu 20% reduziert"-Landingpages
+        'queries': lambda kw: [f"site:otto.de {kw}", f"otto.de {kw}"],
+        'url_check': lambda u: '/p/' in u or '#variationid=' in u or '/pdp/' in u
     },
     'smythtoys': {
         'domain': 'smythstoys.com',
-        'queries': lambda kw: [f"site:smythstoys.com/de {kw}", f"smythstoys.com {kw}"],
-        'url_check': lambda u: '/p/' in u or '/produkt/' in u
+        'queries': lambda kw: [f"site:smythstoys.com {kw}", f"smythstoys.com {kw}"],
+        'url_check': lambda u: '/p/' in u or '/product/' in u or bool(re.search(r'/de/de/.*?\d{5,}', u))
     },
     'decathlon': {
         'domain': 'decathlon.de',
@@ -137,7 +136,7 @@ def scrape():
     session = get_session()
     products = []
 
-    # 1. Direkter Amazon-Versuch (Die alte, gut funktionierende Logik)
+    # 1. Direkter Amazon-Abruf
     if shop_key == 'amazon':
         try:
             products = scrape_amazon_direct(session, keyword)
@@ -162,7 +161,7 @@ def scrape():
         except Exception as e:
             pass
 
-    # 4. Meta-Daten im Hintergrund anreichern (Bilder & JS-Preise für Netto/Kaufland/Smyths)
+    # 4. Meta-Daten im Hintergrund anreichern
     products = enrich_products_parallel(products[:30], shop_key)
 
     return jsonify({
@@ -173,6 +172,42 @@ def scrape():
         "count": len(products),
         "products": products
     })
+
+
+def parse_amazon_item_price(item):
+    """Extrem robuster Amazon Preis-Parser direkt auf der Suchkarte"""
+    selectors = [
+        '.a-price .a-offscreen',
+        'span.a-price span.a-offscreen',
+        '#corePrice_feature_div .a-offscreen',
+        '#corePriceDisplay_desktop_feature_div .a-offscreen',
+        '.a-color-price',
+        '.a-text-price .a-offscreen',
+        'span.a-color-base'
+    ]
+    for sel in selectors:
+        elems = item.select(sel)
+        for elem in elems:
+            p_str = format_price_string(elem.get_text())
+            if p_str != "-":
+                return p_str
+
+    p_w = item.select_one('.a-price-whole')
+    if p_w:
+        p_f = item.select_one('.a-price-fraction')
+        w_txt = re.sub(r'[^\d]', '', p_w.get_text())
+        f_txt = re.sub(r'[^\d]', '', p_f.get_text()) if p_f else "00"
+        if w_txt:
+            f_txt_fmt = f_txt if len(f_txt) == 2 else f_txt.ljust(2, '0')
+            return f"{w_txt},{f_txt_fmt} €"
+
+    # Regex Fallback direkt im Text der Kachel
+    item_text = item.get_text()
+    match = re.search(r'(\d{1,4}[.,]\d{2})\s*€', item_text) or re.search(r'€\s*(\d{1,4}[.,]\d{2})', item_text)
+    if match:
+        return f"{match.group(1).replace('.', ',')} €"
+
+    return "-"
 
 
 def scrape_amazon_direct(session, keyword):
@@ -210,31 +245,7 @@ def scrape_amazon_direct(session, keyword):
         link = f"https://www.amazon.de/dp/{asin}"
         img_tag = item.select_one('img.s-image')
         img_url = img_tag['src'] if img_tag and img_tag.has_attr('src') else get_amazon_image_url(asin)
-
-        price = "-"
-        price_selectors = [
-            '.a-price .a-offscreen',
-            'span.a-price',
-            '#corePrice_feature_div .a-offscreen',
-            '#corePriceDisplay_desktop_feature_div .a-offscreen',
-            '.a-color-price',
-            '.a-text-price .a-offscreen'
-        ]
-        for selector in price_selectors:
-            p_elem = item.select_one(selector)
-            if p_elem:
-                formatted = format_price_string(p_elem.get_text())
-                if formatted != "-":
-                    price = formatted
-                    break
-
-        if price == "-":
-            p_w = item.select_one('.a-price-whole')
-            p_f = item.select_one('.a-price-fraction')
-            if p_w:
-                w_txt = p_w.get_text().replace('.', '').replace(',', '').strip()
-                f_txt = p_f.get_text().strip() if p_f else "00"
-                price = f"{w_txt},{f_txt} €"
+        price = parse_amazon_item_price(item)
 
         products.append({
             "title": title,
@@ -252,7 +263,6 @@ def search_ddg_html(session, shop_key, keyword):
 
     for q in queries:
         try:
-            url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
             res = session.post("https://html.duckduckgo.com/html/", data={'q': q}, timeout=8)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
@@ -321,7 +331,6 @@ def search_bing(session, shop_key, keyword):
 
 
 def fetch_metadata_for_product(product, shop_key):
-    # Überspringen, wenn bereits Bild und Preis vorhanden
     if product.get('imageUrl') and product.get('price') != '-':
         return product
 
@@ -349,7 +358,6 @@ def fetch_metadata_for_product(product, shop_key):
                     if img_tag and img_tag.get('src'):
                         img_url = img_tag['src']
                
-                # Regex Fallback in Scripts für versteckte JSON-Bilder (z.B. Smyths/Netto)
                 if not img_url:
                     img_match = re.search(r'["\']image["\']\s*:\s*["\'](https?://[^"\']+\.(?:jpg|jpeg|png|webp))["\']', html, re.I)
                     if img_match:
@@ -363,10 +371,8 @@ def fetch_metadata_for_product(product, shop_key):
                         img_url = f"{parsed.scheme}://{parsed.netloc}{img_url}"
                     product['imageUrl'] = img_url
 
-
-            # 2. PREIS EXTRAHIEREN (Mit starkem Skript/JSON Fallback für Shops wie Netto & Smyths)
+            # 2. PREIS EXTRAHIEREN
             if product.get('price') == '-':
-                # Standard HTML-Suchen
                 og_price = soup.find('meta', property='product:price:amount') or soup.find('meta', property='og:price:amount')
                 if og_price and og_price.get('content'):
                     product['price'] = format_price_string(og_price['content'])
@@ -377,15 +383,18 @@ def fetch_metadata_for_product(product, shop_key):
                         val = itemprop_price.get("content") or itemprop_price.get_text()
                         product['price'] = format_price_string(val)
 
-                # Die ultimative "Regex-Bombe", falls der Preis in JavaScript-Daten versteckt ist (Smyths/Netto)
                 if product.get('price') == '-':
                     for s in soup.find_all('script'):
                         if s.string:
-                            # Sucht nach Mustern wie "price": 19.99 oder "price":"19,99" in Skripten
                             m = re.search(r'["\']price["\']\s*:\s*["\']?(\d+[\.,]\d{2})["\']?', s.string)
                             if m:
                                 product['price'] = format_price_string(m.group(1))
                                 break
+
+                if product.get('price') == '-':
+                    price_elem = soup.find(class_=re.compile(r'product-price|current-price|price--current|price-tag|pdp-price', re.I))
+                    if price_elem:
+                        product['price'] = format_price_string(price_elem.get_text())
 
     except Exception:
         pass
@@ -436,18 +445,18 @@ def is_junk_title(title):
     exact_junk = [
         'amazon.de', 'norma24', 'netto online', 'startseite', 'home',
         'willkommen', 'kundenrezensionen', 'produktbeschreibung',
-        'impressum', 'datenschutz', 'agb'
+        'impressum', 'datenschutz', 'agb', 'kaufland.de', 'otto.de'
     ]
     if t in exact_junk: return True
 
-    # Strikter Filter gegen SEO-Titel (z.B. Kaufland "Eigenmarke", Otto "reduziert")
-    junk_keywords = [
+    # Gezielter Filter nur für echte SEO-Marketingtext-Blöcke (keine einzelnen Wörter wie 'reduziert'!)
+    junk_intros = [
         'info zu diesem artikel', 'wareninformationen', 'präzises design',
-        'norma24 online-shop bietet', 'willkommen bei', 'eigenmarke',
-        'kategorie', 'sortiment', 'reduziert', 'sale', 'rabatt', 'gutschein'
+        'norma24 online-shop bietet', 'willkommen bei', 'kidland® ist unsere eigenmarke',
+        'unsere eigenmarke', 'kaufland bietet ihnen', 'herzlich willkommen'
     ]
-    for jk in junk_keywords:
-        if jk in t:
+    for ji in junk_intros:
+        if ji in t:
             return True
 
     return False
@@ -470,7 +479,6 @@ def is_valid_url(url, shop_key):
     if not path or path in ['', 'de', 'de/', 'de_de', 'index.html', 'index.php', 'shop']:
         return False
 
-    # Strikte globale Ausschlussliste für Warenkörbe und Service-Seiten
     bad = [
         '/impressum', '/datenschutz', '/agb', '/service', '/filialen',
         '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/kontakt',
@@ -479,7 +487,6 @@ def is_valid_url(url, shop_key):
     if any(b in u for b in bad):
         return False
 
-    # Nutzt die individuelle Filter-Regel des jeweiligen Shops
     return cfg['url_check'](u)
 
 
@@ -487,8 +494,6 @@ def clean_title(title):
     if not title: return ""
     clean = re.sub(r'\s*[:|-|•]\s*.*$', '', title)
     clean = re.sub(r'(online kaufen|jetzt bestellen|bei Amazon|auf OTTO\.de).*$', '', clean, flags=re.IGNORECASE)
-    # Entfernt Sätze wie "Bis zu 20% reduziert"
-    clean = re.sub(r'(?i)bis zu \d+%.*?(reduziert|rabatt)', '', clean)
     return clean.strip()
 
 
