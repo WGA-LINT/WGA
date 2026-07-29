@@ -1,7 +1,8 @@
-from flask import Flask, request, jsonify
-from bs4 import BeautifulSoup
+import os
 import re
 import urllib.parse
+from flask import Flask, request, jsonify
+from bs4 import BeautifulSoup
 
 try:
     from curl_cffi import requests as crequests
@@ -73,7 +74,7 @@ def scrape():
         except Exception as e:
             print(f"Direct Amazon Error: {e}")
 
-    # Strategie 2: Qwant Engine (Absolut Server-IP-freundlich)
+    # Strategie 2: Qwant Engine (Server-IP freundlich)
     if len(products) < 5:
         try:
             qwant_prods = search_qwant(session, target_domain, keyword)
@@ -254,37 +255,8 @@ def enrich_products(products, shop_key):
                 p['link'] = f"https://www.amazon.de/dp/{asin}"
                 p['imageUrl'] = f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX300_.jpg"
     return products
-Schritt 2: Aufwärm-Logik in Google Apps Script (Code.gs) einbauen
-Da Render im Schlafmodus ca. 30 Sekunden zum Aufwachen braucht, muss Google Apps Script vor der eigentlichen Abfrage einen Ping-Request senden, um Render aufzuwecken.
 
-Ersetze in deinem Google Apps Script die Haupt-Funktion für den Aufruf durch folgende Logik:
 
-JavaScript
-var RENDER_BASE_URL = "https://DEIN-RENDER-NAME.onrender.com"; // Hier deine Render-URL eintragen
-
-function fetchShopData(shopKey, keyword) {
-  // 1. Aufwärm-Ping senden (weckt Render aus dem Schlafmodus)
-  try {
-    UrlFetchApp.fetch(RENDER_BASE_URL + "/ping", { muteHttpExceptions: true });
-  } catch (e) {
-    // Falls der Server schläft, 5 Sekunden warten und nochmals pingen
-    Utilities.sleep(5000);
-    UrlFetchApp.fetch(RENDER_BASE_URL + "/ping", { muteHttpExceptions: true });
-  }
-
-  // 2. Eigentliche Scraping-Anfrage mit erhöhtem Timeout durchführen
-  var scrapeUrl = RENDER_BASE_URL + "/scrape?shop=" + shopKey + "&keyword=" + encodeURIComponent(keyword);
-  var options = {
-    method: "get",
-    muteHttpExceptions: true
-  };
-
-  var response = UrlFetchApp.fetch(scrapeUrl, options);
-  var json = JSON.parse(response.getContentText());
-  return json;
-}
-
-if __name __ == '__main__':
-import os
-port = int(os.environ.get("PORT, 10000))
-app.run(host='0.0.0.0', port=port)
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
