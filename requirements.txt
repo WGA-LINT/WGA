@@ -1,6 +1,4 @@
-flask
-gunicorn
+Flask
+beautifulsoup4beautifulsoup4beautifulsoup4
 curl_cffi
-beautifulsoup4
-duckduckgo-search
-lxml
+gunicorn
