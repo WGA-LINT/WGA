@@ -29,20 +29,73 @@ HEADERS = {
     'Upgrade-Insecure-Requests': '1'
 }
 
-SHOP_DOMAINS = {
-    'amazon': 'amazon.de',
-    'norma': 'norma24.de',
-    'netto': 'netto-online.de',
-    'obi': 'obi.de',
-    'hm': 'hm.com',
-    'ikea': 'ikea.com',
-    'jysk': 'jysk.de',
-    'kaufland': 'kaufland.de',
-    'otto': 'otto.de',
-    'smythtoys': 'smythstoys.com',
-    'decathlon': 'decathlon.de',
-    'cna': 'c-and-a.com',
-    'bauhaus': 'bauhaus.info'
+# Modulare Konfiguration pro Shop: JEDER Shop hat eigene Suchstrings & URL-Regeln
+SHOP_CONFIG = {
+    'amazon': {
+        'domain': 'amazon.de',
+        'queries': lambda kw: [f"site:amazon.de {kw}", f"amazon.de {kw} kaufen"],
+        'url_check': lambda u: bool(re.search(r'/(dp|gp/product)/[a-z0-9]{10}', u, re.I) or re.search(r'/[a-z0-9]{10}(?:[/?]|$)', u, re.I))
+    },
+    'norma': {
+        'domain': 'norma24.de',
+        'queries': lambda kw: [f"site:norma24.de {kw}", f"norma24.de {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith(('norma24.de', 'norma24.de/de')) and '/kategorie/' not in u
+    },
+    'netto': {
+        'domain': 'netto-online.de',
+        'queries': lambda kw: [f"site:netto-online.de {kw}", f"netto-online.de {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith(('netto-online.de', 'netto-online.de/de')) and '/filialen' not in u and '/prospekt' not in u
+    },
+    'obi': {
+        'domain': 'obi.de',
+        'queries': lambda kw: [f"site:obi.de {kw}", f"obi.de {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith('obi.de') and '/ratgeber' not in u and '/markt' not in u
+    },
+    'hm': {
+        'domain': 'hm.com',
+        'queries': lambda kw: [f"site:hm.com {kw}", f"hm.com {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith(('hm.com', 'hm.com/de_de'))
+    },
+    'ikea': {
+        'domain': 'ikea.com',
+        'queries': lambda kw: [f"site:ikea.com {kw}", f"ikea.com {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith(('ikea.com', 'ikea.com/de/de')) and '/cat/' not in u
+    },
+    'jysk': {
+        'domain': 'jysk.de',
+        'queries': lambda kw: [f"site:jysk.de {kw}", f"jysk.de {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith('jysk.de')
+    },
+    'kaufland': {
+        'domain': 'kaufland.de',
+        'queries': lambda kw: [f"site:kaufland.de {kw}", f"kaufland.de {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith('kaufland.de') and '/kategorie/' not in u
+    },
+    'otto': {
+        'domain': 'otto.de',
+        'queries': lambda kw: [f"site:otto.de {kw}", f"otto.de {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith('otto.de') and '/updated/' not in u
+    },
+    'smythtoys': {
+        'domain': 'smythstoys.com',
+        'queries': lambda kw: [f"site:smythstoys.com {kw}", f"smythstoys.com {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith(('smythstoys.com', 'smythstoys.com/de/de'))
+    },
+    'decathlon': {
+        'domain': 'decathlon.de',
+        'queries': lambda kw: [f"site:decathlon.de {kw}", f"decathlon.de {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith('decathlon.de') and '/c/' not in u
+    },
+    'cna': {
+        'domain': 'c-and-a.com',
+        'queries': lambda kw: [f"site:c-and-a.com {kw}", f"c-and-a.com {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith(('c-and-a.com', 'c-and-a.com/de/de'))
+    },
+    'bauhaus': {
+        'domain': 'bauhaus.info',
+        'queries': lambda kw: [f"site:bauhaus.info {kw}", f"bauhaus.info {kw}"],
+        'url_check': lambda u: not u.rstrip('/').endswith('bauhaus.info') and '/ueber-bauhaus' not in u
+    }
 }
 
 def get_session():
@@ -74,14 +127,14 @@ def scrape():
     if not keyword or not shop_key:
         return jsonify({"error": "Parameter 'shop' und 'keyword' erforderlich."}), 400
 
-    if shop_key not in SHOP_DOMAINS:
+    if shop_key not in SHOP_CONFIG:
         return jsonify({"error": f"Unbekannter Shop '{shop_key}'."}), 400
 
-    target_domain = SHOP_DOMAINS[shop_key]
+    target_domain = SHOP_CONFIG[shop_key]['domain']
     session = get_session()
     products = []
 
-    # 1. Direktes Amazon Parsing
+    # 1. Direkter Amazon-Versuch
     if shop_key == 'amazon':
         try:
             products = scrape_amazon_direct(session, keyword)
@@ -91,21 +144,22 @@ def scrape():
     # 2. DuckDuckGo Fallback
     if len(products) < 25:
         try:
-            ddg_prods = search_ddg_html(session, target_domain, keyword, shop_key)
+            ddg_prods = search_ddg_html(session, shop_key, keyword)
             products.extend(ddg_prods)
             products = deduplicate(products)
         except Exception as e:
-            pass
+            print(f"DDG Error: {e}")
 
     # 3. Bing Fallback
     if len(products) < 25:
         try:
-            bing_prods = search_bing(session, target_domain, keyword, shop_key)
+            bing_prods = search_bing(session, shop_key, keyword)
             products.extend(bing_prods)
             products = deduplicate(products)
         except Exception as e:
-            pass
+            print(f"Bing Error: {e}")
 
+    # 4. Meta-Daten im Hintergrund anreichern
     products = enrich_products_parallel(products[:30], shop_key)
 
     return jsonify({
@@ -129,7 +183,6 @@ def scrape_amazon_direct(session, keyword):
     res = session.get(url, timeout=8)
    
     if res.status_code != 200 or "captcha" in res.text.lower() or "robot check" in res.text.lower():
-        print("Amazon direct blocked by CAPTCHA.")
         return products
 
     html_content = res.content.decode('utf-8', 'ignore')
@@ -162,8 +215,7 @@ def scrape_amazon_direct(session, keyword):
             '#corePrice_feature_div .a-offscreen',
             '#corePriceDisplay_desktop_feature_div .a-offscreen',
             '.a-color-price',
-            '.a-text-price .a-offscreen',
-            'span.a-size-base.a-color-price'
+            '.a-text-price .a-offscreen'
         ]
         for selector in price_selectors:
             p_elem = item.select_one(selector)
@@ -190,36 +242,16 @@ def scrape_amazon_direct(session, keyword):
     return products
 
 
-def get_search_queries(shop_key, domain, keyword):
-    if shop_key == 'amazon':
-        return [
-            f"site:amazon.de/dp/ {keyword}",
-            f"site:amazon.de/gp/product/ {keyword}"
-        ]
-    elif shop_key == 'netto':
-        return [
-            f"site:netto-online.de {keyword}",
-            f"netto-online.de {keyword} p-"
-        ]
-    elif shop_key == 'norma':
-        return [
-            f"site:norma24.de {keyword}",
-            f"norma24.de {keyword}"
-        ]
-    else:
-        return [
-            f"site:{domain} {keyword}",
-            f"{domain} {keyword}"
-        ]
-
-
-def search_ddg_html(session, domain, keyword, shop_key):
+def search_ddg_html(session, shop_key, keyword):
     products = []
-    queries = get_search_queries(shop_key, domain, keyword)
+    if shop_key not in SHOP_CONFIG: return products
+    cfg = SHOP_CONFIG[shop_key]
+    queries = cfg['queries'](keyword)
+
     for q in queries:
         try:
-            url = "https://html.duckduckgo.com/html/"
-            res = session.post(url, data={'q': q}, timeout=6)
+            url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
+            res = session.get(url, timeout=8)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
                 for a in soup.select('a.result__url'):
@@ -227,7 +259,9 @@ def search_ddg_html(session, domain, keyword, shop_key):
                     if 'uddg=' in link:
                         m = re.search(r'uddg=([^&]+)', link)
                         if m: link = urllib.parse.unquote(m.group(1))
-                    if not is_valid_url(link, domain): continue
+                   
+                    if not is_valid_url(link, shop_key):
+                        continue
                    
                     parent = a.find_parent('div', class_='result__body')
                     title, desc = "", ""
@@ -251,12 +285,15 @@ def search_ddg_html(session, domain, keyword, shop_key):
     return products
 
 
-def search_bing(session, domain, keyword, shop_key):
+def search_bing(session, shop_key, keyword):
     products = []
-    queries = get_search_queries(shop_key, domain, keyword)
+    if shop_key not in SHOP_CONFIG: return products
+    cfg = SHOP_CONFIG[shop_key]
+    queries = cfg['queries'](keyword)
+
     for query in queries:
         try:
-            res = session.get(f"https://www.bing.com/search?q={urllib.parse.quote(query)}", timeout=6)
+            res = session.get(f"https://www.bing.com/search?q={urllib.parse.quote(query)}", timeout=8)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
                 elements = soup.select('li.b_algo, div.b_algo')
@@ -264,7 +301,7 @@ def search_bing(session, domain, keyword, shop_key):
                     a = item.find('a', href=True)
                     if not a: continue
                     link = a['href']
-                    if not is_valid_url(link, domain): continue
+                    if not is_valid_url(link, shop_key): continue
                     title = clean_title(a.get_text())
                     if not title or is_junk_title(title): continue
                    
@@ -398,11 +435,12 @@ def format_price_string(text):
 def is_junk_title(title):
     if not title: return True
     t = title.strip().lower()
-    if len(t) < 6: return True
+    if len(t) < 5: return True
 
     exact_junk = [
         'amazon.de', 'norma24', 'netto online', 'startseite', 'home',
-        'willkommen', 'kundenrezensionen', 'produktbeschreibung'
+        'willkommen', 'kundenrezensionen', 'produktbeschreibung',
+        'impressum', 'datenschutz', 'agb'
     ]
     if t in exact_junk: return True
 
@@ -416,22 +454,32 @@ def is_junk_title(title):
     return False
 
 
-def is_valid_url(url, domain):
+def is_valid_url(url, shop_key):
+    if shop_key not in SHOP_CONFIG:
+        return False
+   
+    cfg = SHOP_CONFIG[shop_key]
+    domain = cfg['domain']
     u = url.lower()
-    if domain not in u: return False
+
+    if domain not in u:
+        return False
 
     parsed = urllib.parse.urlparse(u)
     path = parsed.path.strip('/')
-    if not path or path in ['', 'de', 'de/', 'index.html', 'index.php', 'shop']:
+
+    if not path or path in ['', 'de', 'de/', 'de_de', 'index.html', 'index.php', 'shop']:
         return False
 
-    bad = ['/impressum', '/datenschutz', '/agb', '/service', '/filialen', '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/kontakt']
-    if any(b in u for b in bad): return False
+    bad = [
+        '/impressum', '/datenschutz', '/agb', '/service', '/filialen',
+        '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/kontakt',
+        '/suche', '/search', '/cart', '/account', '/myaccount'
+    ]
+    if any(b in u for b in bad):
+        return False
 
-    if 'amazon.de' in domain:
-        if not ('/dp/' in u or '/gp/product/' in u or re.search(r'/[a-z0-9]{10}(?:[/?]|$)', u)):
-            return False
-    return True
+    return cfg['url_check'](u)
 
 
 def clean_title(title):
