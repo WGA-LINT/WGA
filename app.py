@@ -45,23 +45,6 @@ SHOP_DOMAINS = {
     'bauhaus': 'bauhaus.info'
 }
 
-JUNK_TITLE_PATTERNS = [
-    r'^info zu diesem artikel',
-    r'^wareninformationen',
-    r'^amazon\.de',
-    r'^präzises design',
-    r'^produktbeschreibung',
-    r'^kundenrezensionen',
-    r'^details',
-    r'online-shop',
-    r'riesenauswahl',
-    r'schnelle lieferung',
-    r'günstige preise',
-    r'jetzt.*produkte',
-    r'willkommen bei',
-    r'startseite'
-]
-
 def get_session():
     if HAS_CURL:
         session = crequests.Session(impersonate="chrome120")
@@ -98,12 +81,14 @@ def scrape():
     session = get_session()
     products = []
 
+    # 1. Direktes Amazon Parsing
     if shop_key == 'amazon':
         try:
             products = scrape_amazon_direct(session, keyword)
         except Exception as e:
             print(f"Direct Amazon Error: {e}")
 
+    # 2. DuckDuckGo Fallback
     if len(products) < 25:
         try:
             ddg_prods = search_ddg_html(session, target_domain, keyword, shop_key)
@@ -112,6 +97,7 @@ def scrape():
         except Exception as e:
             pass
 
+    # 3. Bing Fallback
     if len(products) < 25:
         try:
             bing_prods = search_bing(session, target_domain, keyword, shop_key)
@@ -135,14 +121,15 @@ def scrape():
 def scrape_amazon_direct(session, keyword):
     products = []
     try:
-        session.get("https://www.amazon.de", timeout=5)
+        session.get("https://www.amazon.de", timeout=4)
     except Exception:
         pass
 
     url = f"https://www.amazon.de/s?k={urllib.parse.quote(keyword)}&ref=nb_sb_noss"
-    res = session.get(url, timeout=10)
+    res = session.get(url, timeout=8)
    
-    if res.status_code != 200 or "captcha" in res.text.lower():
+    if res.status_code != 200 or "captcha" in res.text.lower() or "robot check" in res.text.lower():
+        print("Amazon direct blocked by CAPTCHA.")
         return products
 
     html_content = res.content.decode('utf-8', 'ignore')
@@ -168,7 +155,6 @@ def scrape_amazon_direct(session, keyword):
         img_tag = item.select_one('img.s-image')
         img_url = img_tag['src'] if img_tag and img_tag.has_attr('src') else get_amazon_image_url(asin)
 
-        # Erweitertes Preis-Parsing für Amazon
         price = "-"
         price_selectors = [
             '.a-price .a-offscreen',
@@ -204,74 +190,93 @@ def scrape_amazon_direct(session, keyword):
     return products
 
 
+def get_search_queries(shop_key, domain, keyword):
+    if shop_key == 'amazon':
+        return [
+            f"site:amazon.de/dp/ {keyword}",
+            f"site:amazon.de/gp/product/ {keyword}"
+        ]
+    elif shop_key == 'netto':
+        return [
+            f"site:netto-online.de {keyword}",
+            f"netto-online.de {keyword} p-"
+        ]
+    elif shop_key == 'norma':
+        return [
+            f"site:norma24.de {keyword}",
+            f"norma24.de {keyword}"
+        ]
+    else:
+        return [
+            f"site:{domain} {keyword}",
+            f"{domain} {keyword}"
+        ]
+
+
 def search_ddg_html(session, domain, keyword, shop_key):
     products = []
-    brand_name = domain.split('.')[0].replace('-online', '')
-    queries = [
-        f"site:{domain} {keyword}",
-        f"{domain} {keyword}",
-        f"{brand_name} {keyword} kaufen"
-    ]
+    queries = get_search_queries(shop_key, domain, keyword)
     for q in queries:
-        url = "https://html.duckduckgo.com/html/"
-        res = session.post(url, data={'q': q}, timeout=10)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
-            for a in soup.select('a.result__url'):
-                link = a.get('href', '')
-                if 'uddg=' in link:
-                    m = re.search(r'uddg=([^&]+)', link)
-                    if m: link = urllib.parse.unquote(m.group(1))
-                if not is_valid_url(link, domain): continue
-               
-                parent = a.find_parent('div', class_='result__body')
-                title, desc = "", ""
-                if parent:
-                    t_elem = parent.select_one('a.result__snippet') or parent.select_one('h2') or parent.select_one('.result__title')
-                    if t_elem: title = clean_title(t_elem.get_text())
-                    desc = parent.get_text()
-               
-                if not title: title = clean_title(a.get_text())
-                if not title or is_junk_title(title): continue
+        try:
+            url = "https://html.duckduckgo.com/html/"
+            res = session.post(url, data={'q': q}, timeout=6)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
+                for a in soup.select('a.result__url'):
+                    link = a.get('href', '')
+                    if 'uddg=' in link:
+                        m = re.search(r'uddg=([^&]+)', link)
+                        if m: link = urllib.parse.unquote(m.group(1))
+                    if not is_valid_url(link, domain): continue
+                   
+                    parent = a.find_parent('div', class_='result__body')
+                    title, desc = "", ""
+                    if parent:
+                        t_elem = parent.select_one('a.result__snippet') or parent.select_one('h2') or parent.select_one('.result__title')
+                        if t_elem: title = clean_title(t_elem.get_text())
+                        desc = parent.get_text()
+                   
+                    if not title: title = clean_title(a.get_text())
+                    if not title or is_junk_title(title): continue
 
-                products.append({
-                    "title": title,
-                    "price": extract_price(desc),
-                    "imageUrl": "",
-                    "link": link.split('?')[0]
-                })
-        if len(products) >= 30: break
+                    products.append({
+                        "title": title,
+                        "price": extract_price(desc),
+                        "imageUrl": "",
+                        "link": link.split('?')[0]
+                    })
+        except Exception:
+            pass
+        if len(products) >= 25: break
     return products
 
 
 def search_bing(session, domain, keyword, shop_key):
     products = []
-    brand_name = domain.split('.')[0].replace('-online', '')
-    queries = [
-        f"site:{domain} {keyword}",
-        f"{domain} {keyword}",
-        f"{brand_name} {keyword} online"
-    ]
+    queries = get_search_queries(shop_key, domain, keyword)
     for query in queries:
-        res = session.get(f"https://www.bing.com/search?q={urllib.parse.quote(query)}", timeout=10)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
-            elements = soup.select('li.b_algo, div.b_algo')
-            for item in elements:
-                a = item.find('a', href=True)
-                if not a: continue
-                link = a['href']
-                if not is_valid_url(link, domain): continue
-                title = clean_title(a.get_text())
-                if not title or is_junk_title(title): continue
-               
-                products.append({
-                    "title": title,
-                    "price": extract_price(item.get_text()),
-                    "imageUrl": "",
-                    "link": link.split('?')[0]
-                })
-        if len(products) >= 30: break
+        try:
+            res = session.get(f"https://www.bing.com/search?q={urllib.parse.quote(query)}", timeout=6)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
+                elements = soup.select('li.b_algo, div.b_algo')
+                for item in elements:
+                    a = item.find('a', href=True)
+                    if not a: continue
+                    link = a['href']
+                    if not is_valid_url(link, domain): continue
+                    title = clean_title(a.get_text())
+                    if not title or is_junk_title(title): continue
+                   
+                    products.append({
+                        "title": title,
+                        "price": extract_price(item.get_text()),
+                        "imageUrl": "",
+                        "link": link.split('?')[0]
+                    })
+        except Exception:
+            pass
+        if len(products) >= 25: break
     return products
 
 
@@ -284,9 +289,9 @@ def fetch_metadata_for_product(product, shop_key):
         cookies = {"i18n-prefs": "EUR", "lc-main": "de_DE"} if shop_key == 'amazon' or 'amazon.de' in product['link'] else {}
 
         if HAS_CURL:
-            res = crequests.get(product['link'], impersonate="chrome120", headers=extra_headers, cookies=cookies, timeout=8)
+            res = crequests.get(product['link'], impersonate="chrome120", headers=extra_headers, cookies=cookies, timeout=6)
         else:
-            res = crequests.get(product['link'], headers=extra_headers, cookies=cookies, timeout=8)
+            res = crequests.get(product['link'], headers=extra_headers, cookies=cookies, timeout=6)
 
         if res.status_code == 200:
             html = res.content.decode('utf-8', 'ignore')
@@ -311,7 +316,7 @@ def fetch_metadata_for_product(product, shop_key):
                         img_url = f"{parsed.scheme}://{parsed.netloc}{img_url}"
                     product['imageUrl'] = img_url
 
-            # 2. Preis extrahieren (inkl. Amazon-Spezialstrukturen auf der Produktdetailseite)
+            # 2. Preis extrahieren
             if product.get('price') == '-':
                 if 'amazon.de' in product['link']:
                     az_selectors = [
@@ -319,7 +324,6 @@ def fetch_metadata_for_product(product, shop_key):
                         '#corePriceDisplay_desktop_feature_div .a-offscreen',
                         '#priceblock_ourprice',
                         '#priceblock_dealprice',
-                        '#priceblock_saleprice',
                         'span.a-price span.a-offscreen',
                         '.a-color-price'
                     ]
@@ -349,11 +353,6 @@ def fetch_metadata_for_product(product, shop_key):
                             if m:
                                 product['price'] = format_price_string(m.group(1))
                                 break
-
-                if product.get('price') == '-':
-                    price_elem = soup.find(class_=re.compile(r'product-price|current-price|price--current|price-tag|price', re.I))
-                    if price_elem:
-                        product['price'] = format_price_string(price_elem.get_text())
 
     except Exception:
         pass
@@ -397,10 +396,23 @@ def format_price_string(text):
 
 
 def is_junk_title(title):
+    if not title: return True
     t = title.strip().lower()
-    if len(t) < 8: return True
-    for p in JUNK_TITLE_PATTERNS:
-        if re.search(p, t): return True
+    if len(t) < 6: return True
+
+    exact_junk = [
+        'amazon.de', 'norma24', 'netto online', 'startseite', 'home',
+        'willkommen', 'kundenrezensionen', 'produktbeschreibung'
+    ]
+    if t in exact_junk: return True
+
+    junk_starts = [
+        'info zu diesem artikel', 'wareninformationen', 'präzises design',
+        'norma24 online-shop bietet', 'willkommen bei'
+    ]
+    for js in junk_starts:
+        if t.startswith(js): return True
+
     return False
 
 
@@ -408,17 +420,17 @@ def is_valid_url(url, domain):
     u = url.lower()
     if domain not in u: return False
 
-    # Haupt-Domain & reine Root-Pfade wie /de oder / filtern
     parsed = urllib.parse.urlparse(u)
     path = parsed.path.strip('/')
     if not path or path in ['', 'de', 'de/', 'index.html', 'index.php', 'shop']:
         return False
 
-    bad = ['/impressum', '/datenschutz', '/agb', '/service', '/filialen', '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/kontakt', '/b?', '/kategorie/']
+    bad = ['/impressum', '/datenschutz', '/agb', '/service', '/filialen', '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/kontakt']
     if any(b in u for b in bad): return False
 
-    if 'amazon.de' in domain and not ('/dp/' in u or '/gp/product/' in u or re.search(r'/[a-z0-9]{10}', u)):
-        return False
+    if 'amazon.de' in domain:
+        if not ('/dp/' in u or '/gp/product/' in u or re.search(r'/[a-z0-9]{10}(?:[/?]|$)', u)):
+            return False
     return True
 
 
