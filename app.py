@@ -3,14 +3,6 @@ from bs4 import BeautifulSoup
 import re
 import urllib.parse
 
-# 1. DuckDuckGo Engine (Handles vqd-Token & Datacenter-Bypass)
-try:
-    from duckduckgo_search import DDGS
-    HAS_DDGS = True
-except ImportError:
-    HAS_DDGS = False
-
-# 2. TLS Impersonation via curl_cffi
 try:
     from curl_cffi import requests as crequests
     HAS_CURL = True
@@ -22,7 +14,7 @@ app = Flask(__name__)
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept-Language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Language': 'de-DE,de;q=0.9,en-US;q=0.8',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
 }
 
@@ -42,7 +34,7 @@ SHOP_DOMAINS = {
     'bauhaus': 'bauhaus.info'
 }
 
-def make_session():
+def get_session():
     if HAS_CURL:
         session = crequests.Session(impersonate="chrome120")
     else:
@@ -52,12 +44,12 @@ def make_session():
 
 @app.route('/')
 def home():
-    return jsonify({
-        "status": "online",
-        "ddgs_available": HAS_DDGS,
-        "curl_cffi_available": HAS_CURL,
-        "shops": list(SHOP_DOMAINS.keys())
-    })
+    return jsonify({"status": "online", "message": "Multi-Shop Scraper API Live"})
+
+@app.route('/ping')
+def ping():
+    """Aufwärm-Endpunkt gegen Render Cold-Starts"""
+    return jsonify({"status": "ready"})
 
 @app.route('/scrape', methods=['GET'])
 def scrape():
@@ -71,28 +63,36 @@ def scrape():
         return jsonify({"error": f"Unbekannter Shop '{shop_key}'."}), 400
 
     target_domain = SHOP_DOMAINS[shop_key]
+    session = get_session()
     products = []
 
-    # Stufe 1: DuckDuckGo Native API (Am verlässlichsten auf Datacenter-IPs)
-    if HAS_DDGS:
-        products = search_ddgs(target_domain, keyword)
+    # Strategie 1: Direktes Amazon HTML-Parsing via curl_cffi
+    if shop_key == 'amazon':
+        try:
+            products = scrape_amazon_direct(session, keyword)
+        except Exception as e:
+            print(f"Direct Amazon Error: {e}")
 
-    # Stufe 2: Google Search Fallback mit TLS Impersonation
+    # Strategie 2: Qwant Engine (Absolut Server-IP-freundlich)
     if len(products) < 5:
-        session = make_session()
-        google_prods = search_google(session, target_domain, keyword)
-        products.extend(google_prods)
-        products = deduplicate_products(products)
+        try:
+            qwant_prods = search_qwant(session, target_domain, keyword)
+            products.extend(qwant_prods)
+            products = deduplicate(products)
+        except Exception as e:
+            print(f"Qwant Error: {e}")
 
-    # Stufe 3: Yahoo Multi-Search Fallback
+    # Strategie 3: Bing Fallback
     if len(products) < 5:
-        session = make_session()
-        yahoo_prods = search_yahoo(session, target_domain, keyword)
-        products.extend(yahoo_prods)
-        products = deduplicate_products(products)
+        try:
+            bing_prods = search_bing(session, target_domain, keyword)
+            products.extend(bing_prods)
+            products = deduplicate(products)
+        except Exception as e:
+            print(f"Bing Error: {e}")
 
-    # Nachbearbeitung: Amazon ASIN-Extraktion & Bild-Generierung
-    products = enrich_products(products, shop_key, target_domain)
+    # Nachbearbeitung Links & Bilder
+    products = enrich_products(products, shop_key)
 
     return jsonify({
         "status": "success",
@@ -104,128 +104,124 @@ def scrape():
     })
 
 
-def search_ddgs(domain, keyword):
-    """Sucht über die offizielle DuckDuckGo-Python-Engine mit Token-Handshake"""
+def scrape_amazon_direct(session, keyword):
+    products = []
+    url = f"https://www.amazon.de/s?k={urllib.parse.quote(keyword)}"
+    res = session.get(url, timeout=10)
+   
+    if res.status_code != 200:
+        return products
+
+    soup = BeautifulSoup(res.text, 'html.parser')
+    items = soup.select('div[data-component-type="s-search-result"]')
+
+    for item in items:
+        asin = item.get('data-asin', '')
+        title_tag = item.select_one('h2 a span') or item.select_one('h2')
+        if not asin or not title_tag:
+            continue
+
+        title = title_tag.get_text().strip()
+        link = f"https://www.amazon.de/dp/{asin}"
+        img_url = f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX300_.jpg"
+
+        price = "-"
+        p_w = item.select_one('.a-price-whole')
+        p_f = item.select_one('.a-price-fraction')
+        if p_w:
+            w_txt = p_w.get_text().replace('.', '').strip()
+            f_txt = p_f.get_text().strip() if p_f else "00"
+            price = f"{w_txt},{f_txt} €"
+
+        products.append({
+            "title": title,
+            "price": price,
+            "imageUrl": img_url,
+            "link": link
+        })
+    return products
+
+
+def search_qwant(session, domain, keyword):
     products = []
     query = f"site:{domain} {keyword}"
-    try:
-        results = list(DDGS().text(query, region="de-de", max_results=35))
-        for r in results:
-            link = r.get('href', '')
-            title = r.get('title', '')
-            snippet = r.get('body', '')
+    url = f"https://api.qwant.com/v3/search/web?q={urllib.parse.quote(query)}&count=30&locale=de_de"
+   
+    headers = dict(HEADERS)
+    headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+   
+    res = session.get(url, headers=headers, timeout=10)
+    if res.status_code == 200:
+        data = res.json()
+        items = data.get('data', {}).get('result', {}).get('items', {}).get('main', [])
+        for it in items:
+            link = it.get('url', '')
+            title = it.get('title', '')
+            desc = it.get('desc', '')
 
-            if not is_valid_product_url(link, domain):
+            if not is_valid_url(link, domain):
                 continue
 
-            clean_title = clean_product_title(title, domain)
-            if not clean_title:
+            clean_t = clean_title(title)
+            if not clean_t:
                 continue
 
-            price = extract_price(snippet)
+            price = extract_price(desc)
 
             products.append({
-                "title": clean_title,
+                "title": clean_t,
                 "price": price,
                 "imageUrl": "",
                 "link": link.split('?')[0]
             })
-    except Exception as e:
-        print(f"DDGS Engine Error: {e}")
     return products
 
 
-def search_google(session, domain, keyword):
-    """Sucht über Google Search mit Chrome-TLS-Signaturen"""
+def search_bing(session, domain, keyword):
     products = []
-    url = f"https://www.google.de/search?q=site:{domain}+{urllib.parse.quote(keyword)}&num=30&hl=de"
-    try:
-        res = session.get(url, timeout=10)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, 'lxml')
-            for g in soup.select('div.g'):
-                a = g.find('a', href=True)
-                h3 = g.find('h3')
-                if not a or not h3:
-                    continue
+    url = f"https://www.bing.com/search?q=site:{domain}+{urllib.parse.quote(keyword)}"
+    res = session.get(url, timeout=10)
+    if res.status_code == 200:
+        soup = BeautifulSoup(res.text, 'html.parser')
+        for item in soup.select('li.b_algo'):
+            a = item.find('a', href=True)
+            if not a:
+                continue
+            link = a['href']
+            if not is_valid_url(link, domain):
+                continue
 
-                link = a['href']
-                if not is_valid_product_url(link, domain):
-                    continue
+            title = clean_title(a.get_text())
+            if not title:
+                continue
 
-                title = clean_product_title(h3.get_text(), domain)
-                if not title:
-                    continue
-
-                snippet_el = g.select_one('div.VwiC3b') or g
-                price = extract_price(snippet_el.get_text())
-
-                products.append({
-                    "title": title,
-                    "price": price,
-                    "imageUrl": "",
-                    "link": link.split('?')[0]
-                })
-    except Exception as e:
-        print(f"Google Search Error: {e}")
-        return products
+            price = extract_price(item.get_text())
+            products.append({
+                "title": title,
+                "price": price,
+                "imageUrl": "",
+                "link": link.split('?')[0]
+            })
     return products
 
 
-def search_yahoo(session, domain, keyword):
-    """Sucht über Yahoo Search als dritter Absicherungs-Layer"""
-    products = []
-    url = f"https://search.yahoo.com/search?p=site:{domain}+{urllib.parse.quote(keyword)}"
-    try:
-        res = session.get(url, timeout=10)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, 'lxml')
-            for div in soup.find_all('div', class_='compTitle'):
-                a = div.find('a', href=True)
-                if not a:
-                    continue
-                link = a['href']
-                if not is_valid_product_url(link, domain):
-                    continue
-
-                title = clean_product_title(a.get_text(), domain)
-                if not title:
-                    continue
-
-                parent = div.find_parent('div', class_='dd')
-                price = extract_price(parent.get_text()) if parent else "-"
-
-                products.append({
-                    "title": title,
-                    "price": price,
-                    "imageUrl": "",
-                    "link": link.split('?')[0]
-                })
-    except Exception as e:
-        print(f"Yahoo Search Error: {e}")
-    return products
-
-
-def is_valid_product_url(url, domain):
+def is_valid_url(url, domain):
     u = url.lower()
     if domain not in u:
         return False
-
-    bad_paths = ['/impressum', '/datenschutz', '/agb', '/service', '/filialen', '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/presse', '/kontakt', '/konto']
-    if any(b in u for b in bad_paths):
+    bad = ['/impressum', '/datenschutz', '/agb', '/service', '/filialen', '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/kontakt']
+    if any(b in u for b in bad):
         return False
-
-    if 'amazon.de' in domain and not ('/dp/' in u or '/gp/product/' in u or '/asin/' in u):
+    if 'amazon.de' in domain and not ('/dp/' in u or '/gp/product/' in u):
         return False
-
     return True
 
 
-def clean_product_title(title, domain):
+def clean_title(title):
     if not title:
         return ""
     clean = re.sub(r'\s*[:|-|•]\s*.*$', '', title)
-    clean = re.sub(r'(online kaufen|jetzt bestellen|bei Amazon|auf OTTO\.de|im Shop|kaufen bei).*$', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'(online kaufen|jetzt bestellen|bei Amazon|auf OTTO\.de).*$', '', clean, flags=re.IGNORECASE)
     return clean.strip()
 
 
@@ -239,26 +235,51 @@ def extract_price(text):
     return "-"
 
 
-def deduplicate_products(products):
+def deduplicate(products):
     seen = set()
     unique = []
     for p in products:
-        ident = p['link'].lower()
-        if ident not in seen:
-            seen.add(ident)
+        if p['link'].lower() not in seen:
+            seen.add(p['link'].lower())
             unique.append(p)
     return unique
 
 
-def enrich_products(products, shop_key, domain):
-    """Reichert Links und Bilder universell an"""
+def enrich_products(products, shop_key):
     for p in products:
-        # Amazon Synthese: Aus der ASIN im Link wird das Bild & der saubere Link gebaut
         if shop_key == 'amazon' or 'amazon.de' in p['link']:
             asin_match = re.search(r'(?:dp/|gp/product/|/)([A-Z0-9]{10})(?:[\?/]|$)', p['link'])
             if asin_match:
                 asin = asin_match.group(1)
                 p['link'] = f"https://www.amazon.de/dp/{asin}"
                 p['imageUrl'] = f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX300_.jpg"
-
     return products
+Schritt 2: Aufwärm-Logik in Google Apps Script (Code.gs) einbauen
+Da Render im Schlafmodus ca. 30 Sekunden zum Aufwachen braucht, muss Google Apps Script vor der eigentlichen Abfrage einen Ping-Request senden, um Render aufzuwecken.
+
+Ersetze in deinem Google Apps Script die Haupt-Funktion für den Aufruf durch folgende Logik:
+
+JavaScript
+var RENDER_BASE_URL = "https://DEIN-RENDER-NAME.onrender.com"; // Hier deine Render-URL eintragen
+
+function fetchShopData(shopKey, keyword) {
+  // 1. Aufwärm-Ping senden (weckt Render aus dem Schlafmodus)
+  try {
+    UrlFetchApp.fetch(RENDER_BASE_URL + "/ping", { muteHttpExceptions: true });
+  } catch (e) {
+    // Falls der Server schläft, 5 Sekunden warten und nochmals pingen
+    Utilities.sleep(5000);
+    UrlFetchApp.fetch(RENDER_BASE_URL + "/ping", { muteHttpExceptions: true });
+  }
+
+  // 2. Eigentliche Scraping-Anfrage mit erhöhtem Timeout durchführen
+  var scrapeUrl = RENDER_BASE_URL + "/scrape?shop=" + shopKey + "&keyword=" + encodeURIComponent(keyword);
+  var options = {
+    method: "get",
+    muteHttpExceptions: true
+  };
+
+  var response = UrlFetchApp.fetch(scrapeUrl, options);
+  var json = JSON.parse(response.getContentText());
+  return json;
+}
