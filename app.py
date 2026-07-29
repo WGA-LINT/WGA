@@ -59,7 +59,7 @@ def deduplicate(products):
 
 
 # ===================================================================
-# UNIVERSAL-EXTRAKTOR (Gefixt: Verwirft keine echten Produkte mehr)
+# UNIVERSAL-EXTRAKTOR
 # ===================================================================
 def extract_product_tiles(html, domain, url_validator):
     soup = BeautifulSoup(html, 'html.parser')
@@ -85,7 +85,6 @@ def extract_product_tiles(html, domain, url_validator):
                 else: break
             else: break
                
-        # 1. TITEL
         title = ""
         for img_cand in container.find_all('img'):
             alt = img_cand.get('alt', '').strip()
@@ -102,13 +101,11 @@ def extract_product_tiles(html, domain, url_validator):
             title = a.get_text(separator=' ', strip=True)
            
         title = re.sub(r'\s+', ' ', title).strip()
-        # Säubere Titel von Button-Texten
         title = re.sub(r'(In den Warenkorb|Auf die Wunschliste|Merken|Hinzufügen).*$', '', title, flags=re.I).strip()
        
         if len(title) < 4 or title.lower() in ['login', 'warenkorb', 'suche', 'menu', 'konto', 'datenschutz', 'impressum']:
             continue
            
-        # 2. BILD (Inklusive Lazy-Loading)
         img_url = ""
         for img_tag in container.find_all('img'):
             src = (img_tag.get('src') or img_tag.get('data-src') or
@@ -124,7 +121,6 @@ def extract_product_tiles(html, domain, url_validator):
                     img_url = src
                     break
                    
-        # 3. PREIS
         price = "-"
         m = re.search(r'(\d{1,4}[.,]\d{2})\s*€?', container.get_text(separator=' '))
         if m: price = format_price_string(m.group(1))
@@ -136,10 +132,93 @@ def extract_product_tiles(html, domain, url_validator):
 
 
 # ===================================================================
-# DIREKT-SUCH-ROUTINEN PRO SHOP
+# DRITTANBIETER-SUCHE (FALLBACK - Wieder aktiviert!)
+# ===================================================================
+def execute_external_search(session, domain, keyword, valid_url_func):
+    products = []
+    q = f"site:{domain} {keyword}"
+
+    # Bing
+    try:
+        res = session.get(f"https://www.bing.com/search?q={urllib.parse.quote(q)}", timeout=6)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
+            for a in soup.find_all('a', href=True):
+                link = a['href'].split('?')[0]
+                if valid_url_func(link):
+                    t = a.get_text(strip=True)
+                    if len(t) > 5 and not t.lower().startswith('http'):
+                        products.append({"title": re.sub(r'\s*[:|-|•]\s*.*$', '', t), "price": "-", "imageUrl": "", "link": link})
+    except: pass
+    if len(products) >= 15: return products
+
+    # Yahoo
+    try:
+        res = session.get(f"https://de.search.yahoo.com/search?p={urllib.parse.quote(q)}", timeout=6)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.content.decode('utf-8', 'ignore'), 'html.parser')
+            for a in soup.find_all('a', href=True):
+                link = a['href']
+                if 'RU=' in link:
+                    try: link = urllib.parse.unquote(link.split('RU=')[1].split('/RK=')[0])
+                    except: pass
+                link = link.split('?')[0]
+                if valid_url_func(link):
+                    t = a.get_text(strip=True)
+                    if len(t) > 5 and not t.lower().startswith('http'):
+                        products.append({"title": re.sub(r'\s*[:|-|•]\s*.*$', '', t), "price": "-", "imageUrl": "", "link": link})
+    except: pass
+
+    return products
+
+
+# ===================================================================
+# ENRICHER (Wieder angehängt für Preise & Bilder)
+# ===================================================================
+def enrich_single_product(p, session, shop_key):
+    if p.get('imageUrl') and p.get('price') != '-': return p
+    try:
+        res = session.get(p['link'], timeout=6)
+        if res.status_code == 200:
+            html = res.content.decode('utf-8', 'ignore')
+            soup = BeautifulSoup(html, 'html.parser')
+
+            if not p.get('imageUrl'):
+                img = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
+                if img and img.get('content') and not any(bad in img['content'].lower() for bad in ['heart', 'herz', 'icon', 'logo']):
+                    p['imageUrl'] = img['content']
+                else:
+                    m_img = re.search(r'["\'](?:image|imageUrl|src)["\']\s*:\s*["\'](https?://[^"\']+\.(?:jpg|jpeg|png|webp))["\']', html, re.I)
+                    if m_img: p['imageUrl'] = m_img.group(1)
+
+            if p.get('price') == '-':
+                og_p = soup.find('meta', property='product:price:amount') or soup.find('meta', property='og:price:amount')
+                if og_p and og_p.get('content'): p['price'] = format_price_string(og_p['content'])
+                else:
+                    prop = soup.find(attrs={"itemprop": "price"})
+                    if prop: p['price'] = format_price_string(prop.get("content") or prop.get_text())
+                    else:
+                        m_p = re.search(r'["\'](?:price|amount)["\']\s*:\s*["\']?(\d+[\.,]\d{2})["\']?', html)
+                        if m_p: p['price'] = format_price_string(m_p.group(1))
+    except: pass
+    return p
+
+def enrich_products_parallel(session, products, shop_key):
+    items = [p for p in products if not p.get('imageUrl') or p.get('price') == '-'][:30]
+    if items:
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = [executor.submit(enrich_single_product, p, session, shop_key) for p in items]
+            for f in futures:
+                try: f.result()
+                except: pass
+    return products
+
+
+# ===================================================================
+# ISOLIERTE SHOP-ROUTINEN
 # ===================================================================
 
-# 1. AMAZON (Zu 100% unverändert & stabil)
+# 1. AMAZON (100% eingefroren, da es perfekt funktioniert)
 def scrape_amazon(session, keyword):
     products = []
     for page in [1, 2]:
@@ -173,10 +252,11 @@ def scrape_amazon(session, keyword):
                     products.append({"title": title_tag.get_text().strip(), "price": price, "imageUrl": img_url, "link": f"https://www.amazon.de/dp/{asin}"})
         except: pass
 
+    # Kein Enricher nötig, da Amazon perfekt funktioniert.
     return deduplicate(products)[:30]
 
 
-# 2. NORMA
+# 2. NORMA (Isoliert: Fallback und Enricher reaktiviert)
 def scrape_norma(session, keyword):
     def valid_norma(u):
         l = u.lower()
@@ -191,10 +271,14 @@ def scrape_norma(session, keyword):
         if res.status_code == 200:
             products = extract_product_tiles(res.content.decode('utf-8', 'ignore'), 'norma24.de', valid_norma)
     except: pass
-    return deduplicate(products)[:30]
+   
+    if len(products) < 5:
+        products.extend(execute_external_search(session, "norma24.de", keyword, valid_norma))
+   
+    return enrich_products_parallel(session, deduplicate(products)[:30], 'norma')
 
 
-# 3. NETTO
+# 3. NETTO (Isoliert: Fallback und Enricher reaktiviert)
 def scrape_netto(session, keyword):
     def valid_netto(u):
         l = u.lower()
@@ -207,10 +291,14 @@ def scrape_netto(session, keyword):
         if res.status_code == 200:
             products = extract_product_tiles(res.content.decode('utf-8', 'ignore'), 'netto-online.de', valid_netto)
     except: pass
-    return deduplicate(products)[:30]
+   
+    if len(products) < 5:
+        products.extend(execute_external_search(session, "netto-online.de", keyword, valid_netto))
+
+    return enrich_products_parallel(session, deduplicate(products)[:30], 'netto')
 
 
-# 4. KAUFLAND
+# 4. KAUFLAND (100% eingefroren, da es perfekt funktioniert)
 def scrape_kaufland(session, keyword):
     def valid_kaufland(u):
         l = u.lower()
@@ -223,10 +311,12 @@ def scrape_kaufland(session, keyword):
         if res.status_code == 200:
             products = extract_product_tiles(res.content.decode('utf-8', 'ignore'), 'kaufland.de', valid_kaufland)
     except: pass
+
+    # Kein Enricher nötig, Kaufland funktioniert!
     return deduplicate(products)[:30]
 
 
-# 5. OTTO
+# 5. OTTO (Isoliert: Enricher wieder angehängt!)
 def scrape_otto(session, keyword):
     def valid_otto(u):
         l = u.lower()
@@ -239,10 +329,11 @@ def scrape_otto(session, keyword):
         if res.status_code == 200:
             products = extract_product_tiles(res.content.decode('utf-8', 'ignore'), 'otto.de', valid_otto)
     except: pass
-    return deduplicate(products)[:30]
+   
+    return enrich_products_parallel(session, deduplicate(products)[:30], 'otto')
 
 
-# 6. SMYTH TOYS
+# 6. SMYTH TOYS (Isoliert: Fallback und Enricher reaktiviert)
 def scrape_smythtoys(session, keyword):
     def valid_smyth(u):
         l = u.lower()
@@ -255,16 +346,48 @@ def scrape_smythtoys(session, keyword):
         if res.status_code == 200:
             products = extract_product_tiles(res.content.decode('utf-8', 'ignore'), 'smythstoys.com', valid_smyth)
     except: pass
-    return deduplicate(products)[:30]
+   
+    if len(products) < 5:
+        products.extend(execute_external_search(session, "smythstoys.com", keyword, valid_smyth))
+
+    return enrich_products_parallel(session, deduplicate(products)[:30], 'smythtoys')
 
 
-# 7. GENERISCHE DIREKT-SUCHEN (OBI, IKEA, JYSK, H&M, DECATHLON, C&A, BAUHAUS)
+# 7. JYSK (NEU: Eigene isolierte Funktion. Blockt Kategorien rigoros!)
+def scrape_jysk(session, keyword):
+    def valid_jysk(u):
+        l = u.lower()
+        if 'jysk.de' not in l: return False
+        blocks = ['/impressum', '/datenschutz', '/agb', '/login', '/cart', '/konto', '/service', '/kundenservice']
+        if any(b in l for b in blocks): return False
+       
+        # HIER IST DER FILTER: Produkte haben tiefe Links (mindestens 3 Slashes).
+        # Kategorien wie /schlafzimmer haben nur 1 Slash.
+        path = urllib.parse.urlparse(l).path
+        if path.count('/') < 3:
+            return False
+           
+        return True
+
+    products = []
+    try:
+        res = session.get(f"https://jysk.de/search?query={urllib.parse.quote(keyword)}", timeout=8)
+        if res.status_code == 200:
+            products = extract_product_tiles(res.content.decode('utf-8', 'ignore'), 'jysk.de', valid_jysk)
+    except: pass
+
+    if len(products) < 5:
+        products.extend(execute_external_search(session, "jysk.de", keyword, valid_jysk))
+
+    return enrich_products_parallel(session, deduplicate(products)[:30], 'jysk')
+
+
+# 8. GENERISCHE DIREKT-SUCHEN (OBI, H&M, IKEA, DECATHLON, C&A, BAUHAUS)
 def scrape_generic(session, shop_key, domain, keyword):
     search_urls = {
         'obi': f"https://www.obi.de/search/{urllib.parse.quote(keyword)}/",
         'hm': f"https://www2.hm.com/de_de/search-results.html?q={urllib.parse.quote(keyword)}",
         'ikea': f"https://www.ikea.com/de/de/search/?q={urllib.parse.quote(keyword)}",
-        'jysk': f"https://jysk.de/search?query={urllib.parse.quote(keyword)}",
         'decathlon': f"https://www.decathlon.de/search?Ntt={urllib.parse.quote(keyword)}",
         'cna': f"https://www.c-and-a.com/de/de/shop/search?q={urllib.parse.quote(keyword)}",
         'bauhaus': f"https://www.bauhaus.info/suche/produkte?q={urllib.parse.quote(keyword)}"
@@ -278,13 +401,18 @@ def scrape_generic(session, shop_key, domain, keyword):
 
     products = []
     url = search_urls.get(shop_key, f"https://www.{domain}/suche?q={urllib.parse.quote(keyword)}")
+   
     try:
         res = session.get(url, timeout=8)
         if res.status_code == 200:
             products = extract_product_tiles(res.content.decode('utf-8', 'ignore'), domain, valid_generic)
     except: pass
 
-    return deduplicate(products)[:30]
+    # Fallback + Enricher (Für OBI, Bauhaus & Co, denen Bild/Preis fehlten)
+    if len(products) < 5:
+        products.extend(execute_external_search(session, domain, keyword, valid_generic))
+
+    return enrich_products_parallel(session, deduplicate(products)[:30], shop_key)
 
 
 # ===================================================================
@@ -321,6 +449,7 @@ def scrape():
     elif shop_key == 'kaufland': products = scrape_kaufland(session, keyword)
     elif shop_key == 'otto': products = scrape_otto(session, keyword)
     elif shop_key == 'smythtoys': products = scrape_smythtoys(session, keyword)
+    elif shop_key == 'jysk': products = scrape_jysk(session, keyword)
     else: products = scrape_generic(session, shop_key, SHOP_DOMAINS[shop_key], keyword)
 
     return jsonify({
