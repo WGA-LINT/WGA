@@ -67,7 +67,7 @@ def scrape():
     session = get_session()
     products = []
 
-    # Strategie 1: Direktes Amazon HTML-Parsing via curl_cffi
+    # Strategie 1: Direktes Amazon  HTML-Parsing via curl_cffi
     if shop_key == 'amazon':
         try:
             products = scrape_amazon_direct(session, keyword)
