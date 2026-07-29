@@ -1,4 +1,4 @@
 Flask
-beautifulsoup4beautifulsoup4beautifulsoup4
+beautifulsoup4
 curl_cffi
 gunicorn
