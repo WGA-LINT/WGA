@@ -1,5 +1,6 @@
 flask
+gunicorn
 curl_cffi
 beautifulsoup4
-gunicorn
+duckduckgo-search
 lxml
