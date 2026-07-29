@@ -75,21 +75,21 @@ def scrape():
     session = get_session()
     products = []
 
-    # Strategie 1: Direktes Amazon HTML-Parsing
+    # Strategie 1: Direktes Amazon Scraping mit Cookie-Warmup
     if shop_key == 'amazon':
         try:
             products = scrape_amazon_direct(session, keyword)
         except Exception as e:
             print(f"Direct Amazon Error: {e}")
 
-    # Strategie 2: Qwant Engine Fallback
+    # Strategie 2: DuckDuckGo HTML Fallback
     if len(products) < 5:
         try:
-            qwant_prods = search_qwant(session, target_domain, keyword, shop_key)
-            products.extend(qwant_prods)
+            ddg_prods = search_ddg_html(session, target_domain, keyword, shop_key)
+            products.extend(ddg_prods)
             products = deduplicate(products)
         except Exception as e:
-            print(f"Qwant Error: {e}")
+            print(f"DDG Error: {e}")
 
     # Strategie 3: Bing Fallback
     if len(products) < 5:
@@ -100,7 +100,6 @@ def scrape():
         except Exception as e:
             print(f"Bing Error: {e}")
 
-    # Nachbearbeitung Links & Bilder (ASIN für Amazon aufbereiten)
     products = enrich_products(products, shop_key)
 
     return jsonify({
@@ -115,26 +114,33 @@ def scrape():
 
 def scrape_amazon_direct(session, keyword):
     products = []
+   
+    # 1. Cookie Handshake (Startseite laden, um Cookies wie session-id zu sammeln)
+    try:
+        session.get("https://www.amazon.de", timeout=5)
+    except Exception:
+        pass
+
+    # 2. Suchanfrage senden
     url = f"https://www.amazon.de/s?k={urllib.parse.quote(keyword)}"
     res = session.get(url, timeout=10)
    
-    if res.status_code != 200:
-        return products
-
-    # Erkennung von Amazon Bot/CAPTCHA-Sperren
-    if "captcha" in res.text.lower() or "robot check" in res.text.lower():
-        print("Amazon CAPTCHA detected. Falling back to search engines.")
+    if res.status_code != 200 or "captcha" in res.text.lower():
+        print("Amazon direct blocked or CAPTCHA triggered.")
         return products
 
     soup = BeautifulSoup(res.text, 'html.parser')
-    items = soup.select('div[data-component-type="s-search-result"], div[data-asin]:not([data-asin=""])')
+    items = soup.find_all('div', {'data-component-type': 's-search-result'})
+   
+    if not items:
+        items = soup.find_all('div', {'data-asin': True})
 
     for item in items:
         asin = item.get('data-asin', '').strip()
-        if not asin:
+        if not asin or len(asin) != 10:
             continue
 
-        title_tag = item.select_one('h2 a span') or item.select_one('h2') or item.select_one('a.a-link-normal span')
+        title_tag = item.select_one('h2 a span') or item.select_one('h2 span') or item.select_one('a.a-link-normal span')
         if not title_tag:
             continue
 
@@ -146,12 +152,16 @@ def scrape_amazon_direct(session, keyword):
         img_url = f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX300_.jpg"
 
         price = "-"
-        p_w = item.select_one('.a-price-whole')
-        p_f = item.select_one('.a-price-fraction')
-        if p_w:
-            w_txt = p_w.get_text().replace('.', '').replace(',', '').strip()
-            f_txt = p_f.get_text().strip() if p_f else "00"
-            price = f"{w_txt},{f_txt} €"
+        price_tag = item.select_one('.a-price .a-offscreen')
+        if price_tag:
+            price = price_tag.get_text().strip()
+        else:
+            p_w = item.select_one('.a-price-whole')
+            p_f = item.select_one('.a-price-fraction')
+            if p_w:
+                w_txt = p_w.get_text().replace('.', '').replace(',', '').strip()
+                f_txt = p_f.get_text().strip() if p_f else "00"
+                price = f"{w_txt},{f_txt} €"
 
         products.append({
             "title": title,
@@ -162,36 +172,44 @@ def scrape_amazon_direct(session, keyword):
     return products
 
 
-def search_qwant(session, domain, keyword, shop_key):
+def search_ddg_html(session, domain, keyword, shop_key):
     products = []
-    # Bei Amazon gezielt nach Produkt-Seiten (/dp/) suchen
-    if shop_key == 'amazon':
-        query = f"site:amazon.de/dp/ {keyword}"
-    else:
-        query = f"site:{domain} {keyword}"
-
-    url = f"https://api.qwant.com/v3/search/web?q={urllib.parse.quote(query)}&count=30&locale=de_de"
+    query = f"site:{domain} {keyword}" if shop_key != 'amazon' else f"site:amazon.de/dp/ {keyword}"
    
-    res = session.get(url, timeout=10)
+    url = "https://html.duckduckgo.com/html/"
+    data = {'q': query}
+   
+    res = session.post(url, data=data, timeout=10)
     if res.status_code == 200:
-        data = res.json()
-        items = data.get('data', {}).get('result', {}).get('items', {}).get('main', [])
-        for it in items:
-            link = it.get('url', '')
-            title = it.get('title', '')
-            desc = it.get('desc', '')
+        soup = BeautifulSoup(res.text, 'html.parser')
+        for a in soup.select('a.result__url'):
+            link = a.get('href', '')
+            if 'uddg=' in link:
+                match = re.search(r'uddg=([^&]+)', link)
+                if match:
+                    link = urllib.parse.unquote(match.group(1))
 
             if not is_valid_url(link, domain):
                 continue
 
-            clean_t = clean_title(title)
-            if not clean_t:
+            parent = a.find_parent('div', class_='result__body')
+            title = ""
+            desc = ""
+            if parent:
+                t_elem = parent.select_one('a.result__snippet') or parent.select_one('h2')
+                if t_elem:
+                    title = clean_title(t_elem.get_text())
+                desc = parent.get_text()
+
+            if not title:
+                title = clean_title(a.get_text())
+
+            if not title:
                 continue
 
             price = extract_price(desc)
-
             products.append({
-                "title": clean_t,
+                "title": title,
                 "price": price,
                 "imageUrl": "",
                 "link": link.split('?')[0]
@@ -201,12 +219,9 @@ def search_qwant(session, domain, keyword, shop_key):
 
 def search_bing(session, domain, keyword, shop_key):
     products = []
-    if shop_key == 'amazon':
-        query = f"site:amazon.de/dp/ {keyword}"
-    else:
-        query = f"site:{domain} {keyword}"
-
+    query = f"site:{domain} {keyword}" if shop_key != 'amazon' else f"site:amazon.de/dp/ {keyword}"
     url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
+   
     res = session.get(url, timeout=10)
     if res.status_code == 200:
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -236,11 +251,12 @@ def is_valid_url(url, domain):
     u = url.lower()
     if domain not in u:
         return False
-    bad = ['/impressum', '/datenschutz', '/agb', '/service', '/filialen', '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/kontakt', '/b?', '/b/']
+    bad = ['/impressum', '/datenschutz', '/agb', '/service', '/filialen', '/warenkorb', '/login', '/hilfe', '/faq', '/jobs', '/kontakt', '/b?']
     if any(b in u for b in bad):
         return False
-    if 'amazon.de' in domain and not ('/dp/' in u or '/gp/product/' in u or re.search(r'/[a-z0-9]{10}', u)):
-        return False
+    if 'amazon.de' in domain:
+        if not ('/dp/' in u or '/gp/product/' in u or re.search(r'/[a-z0-9]{10}', u)):
+            return False
     return True
 
 
@@ -276,9 +292,9 @@ def deduplicate(products):
 def enrich_products(products, shop_key):
     for p in products:
         if shop_key == 'amazon' or 'amazon.de' in p['link']:
-            asin_match = re.search(r'(?:dp/|gp/product/|/)([A-Z0-9]{10})(?:[\?/]|$)', p['link'])
+            asin_match = re.search(r'(?:dp/|gp/product/|/)([A-Z0-9]{10})(?:[\?/]|$)', p['link'], re.IGNORECASE)
             if asin_match:
-                asin = asin_match.group(1)
+                asin = asin_match.group(1).upper()
                 p['link'] = f"https://www.amazon.de/dp/{asin}"
                 if not p['imageUrl']:
                     p['imageUrl'] = f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX300_.jpg"
